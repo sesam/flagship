@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "flagship-hub",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "FLAGSHIP_HUB",
+        "class_name": "FlagshipHub"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["FlagshipHub"]
+    }
+  ],
+  "vars": {
+    "FLAGSHIP_VERSION": "0.1.0"
+  }
+}

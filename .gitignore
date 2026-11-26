@@ -1,0 +1,20 @@
+# Node / Workers
+node_modules/
+.wrangler/
+dist/
+.dev.vars
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Local runtime & secrets
+logs/
+*.log
+*.local.json
+.env
+.env.*
+!.env.example
+.DS_Store
