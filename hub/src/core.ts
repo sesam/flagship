@@ -632,6 +632,11 @@ export class FlagshipHubCore {
             (prev.status === "running" || prev.status === "starting" || prev.status === "queued") &&
             (th.status === "completed" || th.status === "idle")
           ) {
+            this.sql.exec(
+              "UPDATE ideas SET status = 'done', updated_at = ? WHERE thread_id = ? AND status = 'dispatched'",
+              now,
+              th.threadId,
+            );
             newEvents.push(
               this.recordEvent(
                 "thread_completed",

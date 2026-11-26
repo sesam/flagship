@@ -1,0 +1,32 @@
+# Flagship ADR Append Log (thin, machine- & token-friendly)
+# Append new decisions at the bottom. Keep each entry to Context / Decision / Consequence.
+
+ADR-001 | 2026-11-26 | Safe T3 thread observation via parallel CLI polling
+Context: Opening T3 Code's live statev2.sqlite directly risks write-lock contention; sequential CLI polling across 25+ repos takes ~6s. Some t3 CLI builds emit migration WARN lines to stdout before JSON.
+Decision: Lookout calls `t3 --log-level none thread list --project <path> --json` via a 4-worker ThreadPoolExecutor and parses defensively from the first `[` or `{`.
+Consequence: Zero SQLite locking, ~1.5s poll latency, immune to noisy CLI preambles.
+
+ADR-002 | 2026-11-26 | Dual-layer self-wakeup suppression for Helm
+Context: Helm is itself a watched T3 thread; finishing a turn triggers running->completed, which would push a webhook waking Helm in an infinite loop.
+Decision: Suppress self-wakeups at both Hub (`helm_thread_id` skips event/webhook emission) and T3 webhook filter (`body.events[].threadId notEquals <id>` + 60s coalesce window).
+Consequence: Zero self-wakeup loops even if one layer is misconfigured.
+
+ADR-003 | 2026-11-26 | Tiered CPU saturation spillover in auto-router
+Context: Role affinity alone kept sending research/small tasks to a 4-core VM even when 1m load hit >2x cores while a 10-core workstation sat mostly idle.
+Decision: Apply tiered CPU penalties (`>0.85/c: -20`, `>=1.50/c: -55`, `>=2.25/c: -85`) and emit `overloaded_node` rebalance warnings at `>=1.50/c`.
+Consequence: Light work defaults to VM but automatically spills onto cooler peers under load.
+
+ADR-004 | 2026-11-26 | macOS LaunchAgent PATH, SSL CA, and Python binary resolution
+Context: Under macOS launchd, `/usr/sbin` is absent from PATH (breaking `sysctl`, reporting 0MB RAM), pyenv shims fail without shell init, and some Python builds lack a default CA bundle.
+Decision: Resolve `/usr/sbin/sysctl` and `/usr/bin/vm_stat` explicitly, include `/usr/sbin:/sbin` and `sys.executable` in `install-macos.sh`, and fall back to `/etc/ssl/cert.pem` in SSLContext.
+Consequence: Accurate macOS RAM telemetry and reliable TLS under LaunchAgent.
+
+ADR-005 | 2026-11-26 | Hardening for shared/public reuse (stdin dispatch, allowlist, SSRF, CORS)
+Context: Positional CLI prompts allow leading-`-` flag injection and expose prompt text in `ps`; unvalidated webhooks risk SSRF; wildcard CORS is unnecessary by default.
+Decision: Pass prompts/messages via stdin (`-`), reject leading-`-` option values, enforce allowed-projects directory checks in Lookout, require HTTPS (or localhost) webhooks blocking metadata IPs, omit CORS unless `CORS_ORIGIN` is set, and cap stored events (500) / finished commands (200).
+Consequence: Clean single-operator security boundary without adding runtime dependencies.
+
+ADR-006 | 2026-11-26 | Auto-close dispatched ideas on thread completion
+Context: Ideas linked to dispatched threads stayed in `dispatched` state after their worker finished unless manually updated.
+Decision: When a thread transitions from running/starting/queued to completed/idle, Hub automatically updates matching `dispatched` ideas (`thread_id = th.threadId`) to `done`.
+Consequence: Idea backlog stays accurate with zero extra LLM turns.

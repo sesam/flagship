@@ -263,6 +263,37 @@ describe("FlagshipHubCore security controls", () => {
     const res = await hub.fetch(new Request("https://flagship.test/api/overview"));
     expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
   });
+
+  it("auto-marks a dispatched idea as done when its linked thread completes", async () => {
+    const db = new DatabaseSync(":memory:");
+    const hub = new FlagshipHubCore(createSqliteAdapter(db), "0.1.0", async () => ({ ok: true }));
+
+    const created = await reqJson(hub, "/api/ideas", "POST", { title: "Ship auth fix", priority: "P1" });
+    const ideaId = String(created.data.id);
+    await reqJson(hub, `/api/ideas/${ideaId}`, "PATCH", {
+      status: "dispatched",
+      threadId: "t-auth-1",
+    });
+
+    // Baseline: running
+    await reqJson(
+      hub,
+      "/api/nodes/heartbeat",
+      "POST",
+      makeHeartbeat([{ threadId: "t-auth-1", title: "Ship auth fix", status: "running", itemCount: 1 }]),
+    );
+    // Transition: completed
+    await reqJson(
+      hub,
+      "/api/nodes/heartbeat",
+      "POST",
+      makeHeartbeat([{ threadId: "t-auth-1", title: "Ship auth fix", status: "completed", itemCount: 4 }]),
+    );
+
+    const ideasRes = await reqJson(hub, "/api/ideas");
+    const idea = (ideasRes.data.ideas as Array<{ id: string; status: string }>).find((i) => i.id === ideaId);
+    expect(idea?.status).toBe("done");
+  });
 });
 
 describe("FlagshipHubCore proactive Discord alerts", () => {
