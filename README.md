@@ -2,9 +2,7 @@
 
 **Step up to the bridge. Let your machines run the engine room.**
 
-<!-- IMAGE SLOT 1: Hero banner — drop image at docs/assets/hero.png and uncomment:
-![Flagship](docs/assets/hero.png)
--->
+![Flagship architecture infographic](docs/assets/flagship-infographic.webp)
 
 ## The Story
 
