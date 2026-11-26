@@ -118,13 +118,12 @@ export class FlagshipHubCore {
 
   private ensureSchema(): void {
     if (this.initialized) return;
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS control (
+    const ddlStatements = [
+      `CREATE TABLE IF NOT EXISTS control (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS nodes (
+      )`,
+      `CREATE TABLE IF NOT EXISTS nodes (
         node_id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         role TEXT NOT NULL,
@@ -137,9 +136,8 @@ export class FlagshipHubCore {
         telemetry_json TEXT NOT NULL DEFAULT '{}',
         quota_json TEXT NOT NULL DEFAULT '{}',
         last_seen_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS threads (
+      )`,
+      `CREATE TABLE IF NOT EXISTS threads (
         node_id TEXT NOT NULL,
         thread_id TEXT NOT NULL,
         project_id TEXT,
@@ -156,9 +154,8 @@ export class FlagshipHubCore {
         stalled INTEGER NOT NULL DEFAULT 0,
         dismissed_at TEXT,
         PRIMARY KEY (node_id, thread_id)
-      );
-
-      CREATE TABLE IF NOT EXISTS ideas (
+      )`,
+      `CREATE TABLE IF NOT EXISTS ideas (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
         notes TEXT NOT NULL DEFAULT '',
@@ -172,9 +169,8 @@ export class FlagshipHubCore {
         thread_link TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS commands (
+      )`,
+      `CREATE TABLE IF NOT EXISTS commands (
         id TEXT PRIMARY KEY,
         node_id TEXT NOT NULL,
         kind TEXT NOT NULL,
@@ -183,9 +179,8 @@ export class FlagshipHubCore {
         result_json TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS events (
+      )`,
+      `CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         kind TEXT NOT NULL,
         node_id TEXT,
@@ -194,9 +189,8 @@ export class FlagshipHubCore {
         payload_json TEXT NOT NULL DEFAULT '{}',
         delivered INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS alerts (
+      )`,
+      `CREATE TABLE IF NOT EXISTS alerts (
         alert_key TEXT PRIMARY KEY,
         repo TEXT,
         channel_id TEXT,
@@ -213,8 +207,12 @@ export class FlagshipHubCore {
         note TEXT,
         created_at TEXT,
         updated_at TEXT
-      );
-    `);
+      )`,
+    ];
+
+    for (const stmt of ddlStatements) {
+      this.sql.exec(stmt);
+    }
 
     const threadCols = this.sql
       .exec<{ name: string }>("PRAGMA table_info(threads)")

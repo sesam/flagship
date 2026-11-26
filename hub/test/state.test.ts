@@ -514,4 +514,65 @@ describe("FlagshipHubCore proactive Discord alerts", () => {
     expect(updated.alert.status).toBe("false_positive");
     expect(updated.discordReaction.ok).toBe(true);
   });
+
+  it("migrates an already-initialized legacy DB missing the alerts table", async () => {
+    const db = new DatabaseSync(":memory:");
+    // Pre-populate legacy schema (pre-alerts Durable Object SQLite instance)
+    db.exec(`
+      CREATE TABLE control (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE nodes (
+        node_id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL,
+        environment_id TEXT, owner TEXT NOT NULL DEFAULT 'default',
+        platform TEXT NOT NULL DEFAULT 'unknown', arch TEXT NOT NULL DEFAULT 'unknown',
+        capabilities_json TEXT NOT NULL DEFAULT '[]', projects_json TEXT NOT NULL DEFAULT '[]',
+        telemetry_json TEXT NOT NULL DEFAULT '{}', quota_json TEXT NOT NULL DEFAULT '{}',
+        last_seen_at TEXT NOT NULL
+      );
+      CREATE TABLE threads (
+        node_id TEXT NOT NULL, thread_id TEXT NOT NULL, project_id TEXT, project_title TEXT,
+        project_path TEXT, title TEXT NOT NULL, link TEXT, status TEXT NOT NULL,
+        settled INTEGER NOT NULL DEFAULT 0, snoozed INTEGER NOT NULL DEFAULT 0,
+        item_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+        last_progress_at TEXT NOT NULL, stalled INTEGER NOT NULL DEFAULT 0,
+        dismissed_at TEXT, PRIMARY KEY (node_id, thread_id)
+      );
+      CREATE TABLE ideas (
+        id TEXT PRIMARY KEY, title TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '',
+        priority TEXT NOT NULL DEFAULT 'P2', status TEXT NOT NULL DEFAULT 'inbox',
+        workload TEXT NOT NULL DEFAULT 'small', visibility TEXT NOT NULL DEFAULT 'business',
+        project TEXT, assigned_node TEXT, thread_id TEXT, thread_link TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE commands (
+        id TEXT PRIMARY KEY, node_id TEXT NOT NULL, kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+        result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, node_id TEXT,
+        thread_id TEXT, summary TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}',
+        delivered INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+      );
+      INSERT INTO control (key, value) VALUES ('stand_down', 'false');
+    `);
+
+    const hub = new FlagshipHubCore(createSqliteAdapter(db), "0.1.0", async () => ({ ok: true }));
+
+    const ovRes = await reqJson(hub, "/api/overview");
+    expect(ovRes.status).toBe(200);
+    expect((ovRes.data as unknown as OverviewResponse).openAlerts).toEqual([]);
+    expect((ovRes.data as unknown as OverviewResponse).counts.openAlerts).toBe(0);
+
+    const listRes = await reqJson(hub, "/api/alerts");
+    expect(listRes.status).toBe(200);
+    expect(listRes.data.alerts).toEqual([]);
+
+    const postRes = await reqJson(hub, "/api/alerts", "POST", {
+      alertKey: "legacy:upgrade:test",
+      repo: "flagship",
+      summary: "Alert after legacy DO upgrade",
+    });
+    expect(postRes.status).toBe(201);
+    expect((postRes.data.alert as { alertKey: string }).alertKey).toBe("legacy:upgrade:test");
+  });
 });

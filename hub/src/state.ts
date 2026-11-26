@@ -8,9 +8,12 @@ export class FlagshipHub extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const sql: SqlStorageLike = {
-      exec: <T = Record<string, unknown>>(query: string, ...bindings: unknown[]) => ({
-        toArray: () => ctx.storage.sql.exec(query, ...bindings).toArray() as unknown as T[],
-      }),
+      exec: <T = Record<string, unknown>>(query: string, ...bindings: unknown[]) => {
+        const cursor = ctx.storage.sql.exec(query, ...bindings);
+        return {
+          toArray: () => cursor.toArray() as unknown as T[],
+        };
+      },
     };
     this.core = new FlagshipHubCore(
       sql,
