@@ -218,6 +218,8 @@ export interface OverviewResponse {
   generatedAt: string;
   standDown: boolean;
   standDownReason: string | null;
+  storageDegraded?: boolean;
+  storageWarning?: string;
   counts: {
     nodesOnline: number;
     nodesTotal: number;

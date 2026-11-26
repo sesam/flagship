@@ -19,6 +19,7 @@ import { pushHelmWebhook } from "./webhook";
 
 const STALE_NODE_MS = 90_000;
 const OFFLINE_NODE_MS = 300_000;
+const NODE_PERSIST_INTERVAL_MS = 60_000; // Persist unchanged node heartbeats at most once/min (< STALE_NODE_MS)
 const STALL_THREAD_MS = 20 * 60_000; // 20 min without itemCount/update movement while running
 const MAX_STORED_EVENTS = 500;
 const MAX_FINISHED_COMMANDS = 200;
@@ -37,6 +38,123 @@ const REACTION_ALERT_STATUSES: ReadonlySet<AlertStatus> = new Set([
   "false_positive",
   "wontfix",
 ]);
+
+export function isStorageQuotaError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return /exceeded allowed rows|sqlite_full|storage.*quota|rows written/i.test(msg);
+}
+
+function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
+  if (typeof raw !== "string" || !raw.trim()) return fallback;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed === null || parsed === undefined ? fallback : (parsed as T);
+  } catch {
+    return fallback;
+  }
+}
+
+function toFiniteNumber(value: unknown, fallback: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizeTelemetry(raw: unknown): NodeRecord["telemetry"] {
+  const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const rawDevices = Array.isArray(obj.devices) ? obj.devices : [];
+  const devices = rawDevices
+    .filter((d): d is Record<string, unknown> => Boolean(d && typeof d === "object"))
+    .map((d) => ({
+      id: String(d.id ?? ""),
+      platform: (d.platform === "ios" ? "ios" : "android") as "android" | "ios",
+      name: String(d.name ?? ""),
+      state: String(d.state ?? "unknown"),
+    }));
+  return {
+    ramTotalMb: toFiniteNumber(obj.ramTotalMb, 0),
+    ramFreeMb: toFiniteNumber(obj.ramFreeMb, 0),
+    ramUsedPct: toFiniteNumber(obj.ramUsedPct, 0),
+    cpuCores: toFiniteNumber(obj.cpuCores, 0),
+    load1m: toFiniteNumber(obj.load1m, 0),
+    diskFreeGb: toFiniteNumber(obj.diskFreeGb, 0),
+    activeThreads: toFiniteNumber(obj.activeThreads, 0),
+    maxSlots: Math.max(1, toFiniteNumber(obj.maxSlots, 4)),
+    devices,
+  };
+}
+
+function normalizeQuota(raw: unknown): NodeRecord["quota"] {
+  const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  return {
+    businessMaxSharePct: toFiniteNumber(obj.businessMaxSharePct, 90),
+    spotMinFreeRamPct: toFiniteNumber(obj.spotMinFreeRamPct, 50),
+  };
+}
+
+function normalizeCapabilities(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((c): c is string => typeof c === "string");
+}
+
+function normalizeProjects(raw: unknown): NodeRecord["projects"] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((p): p is Record<string, unknown> => Boolean(p && typeof p === "object"))
+    .map((p) => ({
+      ...(typeof p.id === "string" && p.id ? { id: p.id } : {}),
+      title: String(p.title ?? ""),
+      path: String(p.path ?? ""),
+      ...(typeof p.repo === "string" && p.repo ? { repo: p.repo } : {}),
+    }))
+    .filter((p) => Boolean(p.title || p.path));
+}
+
+function normalizeRecord(raw: unknown): Record<string, unknown> {
+  return raw && typeof raw === "object" && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : {};
+}
+
+interface NodeRow {
+  node_id: string;
+  name: string;
+  role: string;
+  environment_id: string | null;
+  owner: string;
+  platform: string;
+  arch: string;
+  capabilities_json: string;
+  projects_json: string;
+  telemetry_json: string;
+  quota_json: string;
+  last_seen_at: string;
+}
+
+interface ThreadRow {
+  node_id: string;
+  thread_id: string;
+  project_id: string | null;
+  project_title: string | null;
+  project_path: string | null;
+  title: string;
+  link: string | null;
+  status: string;
+  settled: number;
+  snoozed: number;
+  item_count: number;
+  updated_at: string;
+  last_progress_at: string;
+  stalled: number;
+  dismissed_at: string | null;
+}
+
+interface LiveNodeEntry {
+  record: NodeRecord;
+  persistedAtMs: number;
+  metadataKey: string;
+  activeThreads: number;
+  devicesKey: string;
+}
 
 export interface NotifyDiscordConfig {
   url?: string;
@@ -103,6 +221,8 @@ function shortId(prefix: string): string {
 
 export class FlagshipHubCore {
   private initialized = false;
+  private readonly liveNodes = new Map<string, LiveNodeEntry>();
+  private readonly liveThreads = new Map<string, ThreadRow>();
 
   constructor(
     private readonly sql: SqlStorageLike,
@@ -118,107 +238,142 @@ export class FlagshipHubCore {
 
   private ensureSchema(): void {
     if (this.initialized) return;
-    const ddlStatements = [
-      `CREATE TABLE IF NOT EXISTS control (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      )`,
-      `CREATE TABLE IF NOT EXISTS nodes (
-        node_id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        role TEXT NOT NULL,
-        environment_id TEXT,
-        owner TEXT NOT NULL DEFAULT 'default',
-        platform TEXT NOT NULL DEFAULT 'unknown',
-        arch TEXT NOT NULL DEFAULT 'unknown',
-        capabilities_json TEXT NOT NULL DEFAULT '[]',
-        projects_json TEXT NOT NULL DEFAULT '[]',
-        telemetry_json TEXT NOT NULL DEFAULT '{}',
-        quota_json TEXT NOT NULL DEFAULT '{}',
-        last_seen_at TEXT NOT NULL
-      )`,
-      `CREATE TABLE IF NOT EXISTS threads (
-        node_id TEXT NOT NULL,
-        thread_id TEXT NOT NULL,
-        project_id TEXT,
-        project_title TEXT,
-        project_path TEXT,
-        title TEXT NOT NULL,
-        link TEXT,
-        status TEXT NOT NULL,
-        settled INTEGER NOT NULL DEFAULT 0,
-        snoozed INTEGER NOT NULL DEFAULT 0,
-        item_count INTEGER NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL,
-        last_progress_at TEXT NOT NULL,
-        stalled INTEGER NOT NULL DEFAULT 0,
-        dismissed_at TEXT,
-        PRIMARY KEY (node_id, thread_id)
-      )`,
-      `CREATE TABLE IF NOT EXISTS ideas (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        notes TEXT NOT NULL DEFAULT '',
-        priority TEXT NOT NULL DEFAULT 'P2',
-        status TEXT NOT NULL DEFAULT 'inbox',
-        workload TEXT NOT NULL DEFAULT 'small',
-        visibility TEXT NOT NULL DEFAULT 'business',
-        project TEXT,
-        assigned_node TEXT,
-        thread_id TEXT,
-        thread_link TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      )`,
-      `CREATE TABLE IF NOT EXISTS commands (
-        id TEXT PRIMARY KEY,
-        node_id TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        result_json TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      )`,
-      `CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind TEXT NOT NULL,
-        node_id TEXT,
-        thread_id TEXT,
-        summary TEXT NOT NULL,
-        payload_json TEXT NOT NULL DEFAULT '{}',
-        delivered INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL
-      )`,
-      `CREATE TABLE IF NOT EXISTS alerts (
-        alert_key TEXT PRIMARY KEY,
-        repo TEXT,
-        channel_id TEXT,
-        message_id TEXT,
-        source TEXT,
-        severity TEXT,
-        status TEXT,
-        summary TEXT,
-        text TEXT,
-        thread_id TEXT,
-        thread_link TEXT,
-        silent_first INTEGER DEFAULT 0,
-        hit_count INTEGER DEFAULT 1,
-        note TEXT,
-        created_at TEXT,
-        updated_at TEXT
-      )`,
+
+    // Check existing tables via read-only query first so cold-start reads never
+    // trigger DDL/write operations on an already-initialized database.
+    const existingTables = new Set(
+      this.sql
+        .exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .toArray()
+        .map((r) => r.name),
+    );
+
+    const tableDdls: Array<[string, string]> = [
+      [
+        "control",
+        `CREATE TABLE IF NOT EXISTS control (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )`,
+      ],
+      [
+        "nodes",
+        `CREATE TABLE IF NOT EXISTS nodes (
+          node_id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          role TEXT NOT NULL,
+          environment_id TEXT,
+          owner TEXT NOT NULL DEFAULT 'default',
+          platform TEXT NOT NULL DEFAULT 'unknown',
+          arch TEXT NOT NULL DEFAULT 'unknown',
+          capabilities_json TEXT NOT NULL DEFAULT '[]',
+          projects_json TEXT NOT NULL DEFAULT '[]',
+          telemetry_json TEXT NOT NULL DEFAULT '{}',
+          quota_json TEXT NOT NULL DEFAULT '{}',
+          last_seen_at TEXT NOT NULL
+        )`,
+      ],
+      [
+        "threads",
+        `CREATE TABLE IF NOT EXISTS threads (
+          node_id TEXT NOT NULL,
+          thread_id TEXT NOT NULL,
+          project_id TEXT,
+          project_title TEXT,
+          project_path TEXT,
+          title TEXT NOT NULL,
+          link TEXT,
+          status TEXT NOT NULL,
+          settled INTEGER NOT NULL DEFAULT 0,
+          snoozed INTEGER NOT NULL DEFAULT 0,
+          item_count INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL,
+          last_progress_at TEXT NOT NULL,
+          stalled INTEGER NOT NULL DEFAULT 0,
+          dismissed_at TEXT,
+          PRIMARY KEY (node_id, thread_id)
+        )`,
+      ],
+      [
+        "ideas",
+        `CREATE TABLE IF NOT EXISTS ideas (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          notes TEXT NOT NULL DEFAULT '',
+          priority TEXT NOT NULL DEFAULT 'P2',
+          status TEXT NOT NULL DEFAULT 'inbox',
+          workload TEXT NOT NULL DEFAULT 'small',
+          visibility TEXT NOT NULL DEFAULT 'business',
+          project TEXT,
+          assigned_node TEXT,
+          thread_id TEXT,
+          thread_link TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )`,
+      ],
+      [
+        "commands",
+        `CREATE TABLE IF NOT EXISTS commands (
+          id TEXT PRIMARY KEY,
+          node_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          result_json TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )`,
+      ],
+      [
+        "events",
+        `CREATE TABLE IF NOT EXISTS events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind TEXT NOT NULL,
+          node_id TEXT,
+          thread_id TEXT,
+          summary TEXT NOT NULL,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          delivered INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL
+        )`,
+      ],
+      [
+        "alerts",
+        `CREATE TABLE IF NOT EXISTS alerts (
+          alert_key TEXT PRIMARY KEY,
+          repo TEXT,
+          channel_id TEXT,
+          message_id TEXT,
+          source TEXT,
+          severity TEXT,
+          status TEXT,
+          summary TEXT,
+          text TEXT,
+          thread_id TEXT,
+          thread_link TEXT,
+          silent_first INTEGER DEFAULT 0,
+          hit_count INTEGER DEFAULT 1,
+          note TEXT,
+          created_at TEXT,
+          updated_at TEXT
+        )`,
+      ],
     ];
 
-    for (const stmt of ddlStatements) {
-      this.sql.exec(stmt);
+    for (const [tableName, stmt] of tableDdls) {
+      if (!existingTables.has(tableName)) {
+        this.sql.exec(stmt);
+      }
     }
 
-    const threadCols = this.sql
-      .exec<{ name: string }>("PRAGMA table_info(threads)")
-      .toArray();
-    if (!threadCols.some((c) => c.name === "dismissed_at")) {
-      this.sql.exec("ALTER TABLE threads ADD COLUMN dismissed_at TEXT");
+    if (existingTables.has("threads")) {
+      const threadCols = this.sql
+        .exec<{ name: string }>("PRAGMA table_info(threads)")
+        .toArray();
+      if (!threadCols.some((c) => c.name === "dismissed_at")) {
+        this.sql.exec("ALTER TABLE threads ADD COLUMN dismissed_at TEXT");
+      }
     }
 
     this.initialized = true;
@@ -246,89 +401,124 @@ export class FlagshipHubCore {
     };
   }
 
-  private listNodes(): NodeRecord[] {
-    const now = Date.now();
-    const rows = this.sql
-      .exec<{
-        node_id: string;
-        name: string;
-        role: string;
-        environment_id: string | null;
-        owner: string;
-        platform: string;
-        arch: string;
-        capabilities_json: string;
-        projects_json: string;
-        telemetry_json: string;
-        quota_json: string;
-        last_seen_at: string;
-      }>("SELECT * FROM nodes ORDER BY name ASC")
-      .toArray();
-
-    return rows.map((r) => {
-      const ageMs = now - Date.parse(r.last_seen_at);
-      const status: NodeRecord["status"] =
-        ageMs > OFFLINE_NODE_MS ? "offline" : ageMs > STALE_NODE_MS ? "stale" : "online";
-      const quota = JSON.parse(r.quota_json || "{}");
-      return {
-        nodeId: r.node_id,
-        name: r.name,
-        role: r.role as NodeRecord["role"],
-        environmentId: r.environment_id,
-        owner: r.owner,
-        platform: r.platform,
-        arch: r.arch,
-        capabilities: JSON.parse(r.capabilities_json || "[]"),
-        projects: JSON.parse(r.projects_json || "[]"),
-        telemetry: JSON.parse(r.telemetry_json || "{}"),
-        quota: {
-          businessMaxSharePct: quota.businessMaxSharePct ?? 90,
-          spotMinFreeRamPct: quota.spotMinFreeRamPct ?? 50,
-        },
-        status,
-        lastSeenAt: r.last_seen_at,
-      };
-    });
+  private computeNodeStatus(lastSeenAt: string, nowMs: number): NodeRecord["status"] {
+    const parsed = Date.parse(lastSeenAt);
+    if (!Number.isFinite(parsed)) return "offline";
+    const ageMs = nowMs - parsed;
+    return ageMs > OFFLINE_NODE_MS ? "offline" : ageMs > STALE_NODE_MS ? "stale" : "online";
   }
 
-  private listThreads(): StoredThread[] {
-    const rows = this.sql
-      .exec<{
-        node_id: string;
-        thread_id: string;
-        project_id: string | null;
-        project_title: string | null;
-        project_path: string | null;
-        title: string;
-        link: string | null;
-        status: string;
-        settled: number;
-        snoozed: number;
-        item_count: number;
-        updated_at: string;
-        last_progress_at: string;
-        stalled: number;
-        dismissed_at: string | null;
-      }>("SELECT * FROM threads ORDER BY updated_at DESC LIMIT 200")
-      .toArray();
+  private threadRowChanged(prev: ThreadRow | undefined, next: ThreadRow): boolean {
+    if (!prev) return true;
+    return (
+      prev.project_id !== next.project_id ||
+      prev.project_title !== next.project_title ||
+      prev.project_path !== next.project_path ||
+      prev.title !== next.title ||
+      prev.link !== next.link ||
+      prev.status !== next.status ||
+      prev.settled !== next.settled ||
+      prev.snoozed !== next.snoozed ||
+      prev.item_count !== next.item_count ||
+      prev.updated_at !== next.updated_at ||
+      prev.last_progress_at !== next.last_progress_at ||
+      prev.stalled !== next.stalled ||
+      prev.dismissed_at !== next.dismissed_at
+    );
+  }
 
-    return rows.map((r) => ({
-      nodeId: r.node_id,
-      threadId: r.thread_id,
-      projectId: r.project_id,
-      projectTitle: r.project_title,
-      projectPath: r.project_path,
-      title: r.title,
-      link: r.link,
-      status: r.status,
-      settled: Boolean(r.settled),
-      snoozed: Boolean(r.snoozed),
-      itemCount: r.item_count,
-      updatedAt: r.updated_at,
-      lastProgressAt: r.last_progress_at,
-      stalled: Boolean(r.stalled),
-      dismissedAt: r.dismissed_at ?? null,
-    }));
+  private listNodes(allowQuotaFallback = false): { nodes: NodeRecord[]; degraded: boolean } {
+    const now = Date.now();
+    let degraded = false;
+    let rows: NodeRow[] = [];
+
+    try {
+      rows = this.sql.exec<NodeRow>("SELECT * FROM nodes ORDER BY name ASC").toArray();
+    } catch (err) {
+      if (!allowQuotaFallback || !isStorageQuotaError(err)) throw err;
+      degraded = true;
+    }
+
+    const byId = new Map<string, NodeRecord>();
+
+    for (const r of rows) {
+      const record: NodeRecord = {
+        nodeId: r.node_id,
+        name: r.name || r.node_id,
+        role: (r.role || "vm") as NodeRecord["role"],
+        environmentId: r.environment_id ?? null,
+        owner: r.owner || "default",
+        platform: r.platform || "unknown",
+        arch: r.arch || "unknown",
+        capabilities: normalizeCapabilities(safeJsonParse(r.capabilities_json, [])),
+        projects: normalizeProjects(safeJsonParse(r.projects_json, [])),
+        telemetry: normalizeTelemetry(safeJsonParse(r.telemetry_json, {})),
+        quota: normalizeQuota(safeJsonParse(r.quota_json, {})),
+        status: this.computeNodeStatus(r.last_seen_at, now),
+        lastSeenAt: r.last_seen_at || "",
+      };
+      byId.set(r.node_id, record);
+    }
+
+    for (const [nodeId, live] of this.liveNodes.entries()) {
+      const persisted = byId.get(nodeId);
+      const liveMs = Date.parse(live.record.lastSeenAt);
+      const persistedMs = persisted ? Date.parse(persisted.lastSeenAt) : Number.NEGATIVE_INFINITY;
+      if (!persisted || (Number.isFinite(liveMs) && (!Number.isFinite(persistedMs) || liveMs >= persistedMs))) {
+        byId.set(nodeId, {
+          ...live.record,
+          status: this.computeNodeStatus(live.record.lastSeenAt, now),
+        });
+      }
+    }
+
+    return {
+      nodes: Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name)),
+      degraded,
+    };
+  }
+
+  private listThreads(allowQuotaFallback = false): { threads: StoredThread[]; degraded: boolean } {
+    let degraded = false;
+    let rows: ThreadRow[] = [];
+    try {
+      rows = this.sql
+        .exec<ThreadRow>("SELECT * FROM threads ORDER BY updated_at DESC LIMIT 200")
+        .toArray();
+    } catch (err) {
+      if (!allowQuotaFallback || !isStorageQuotaError(err)) throw err;
+      degraded = true;
+    }
+
+    const byKey = new Map<string, ThreadRow>();
+    for (const r of rows) {
+      byKey.set(`${r.node_id}:${r.thread_id}`, r);
+    }
+    for (const [key, live] of this.liveThreads.entries()) {
+      byKey.set(key, live);
+    }
+
+    const threads = Array.from(byKey.values())
+      .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""))
+      .slice(0, 200)
+      .map((r) => ({
+        nodeId: r.node_id,
+        threadId: r.thread_id,
+        projectId: r.project_id,
+        projectTitle: r.project_title,
+        projectPath: r.project_path,
+        title: r.title,
+        link: r.link,
+        status: r.status,
+        settled: Boolean(r.settled),
+        snoozed: Boolean(r.snoozed),
+        itemCount: r.item_count,
+        updatedAt: r.updated_at,
+        lastProgressAt: r.last_progress_at,
+        stalled: Boolean(r.stalled),
+        dismissedAt: r.dismissed_at ?? null,
+      }));
+    return { threads, degraded };
   }
 
   private listIdeas(): IdeaRecord[] {
@@ -370,7 +560,7 @@ export class FlagshipHubCore {
   }
 
   private listEvents(limit = 25): FleetEvent[] {
-    const safeLimit = Math.max(1, Math.min(100, limit));
+    const safeLimit = Math.max(1, Math.min(100, Number.isFinite(limit) ? limit : 25));
     const rows = this.sql
       .exec<{
         id: number;
@@ -390,7 +580,7 @@ export class FlagshipHubCore {
       nodeId: r.node_id,
       threadId: r.thread_id,
       summary: r.summary,
-      payload: JSON.parse(r.payload_json || "{}"),
+      payload: normalizeRecord(safeJsonParse(r.payload_json, {})),
       delivered: Boolean(r.delivered),
       createdAt: r.created_at,
     }));
@@ -447,7 +637,13 @@ export class FlagshipHubCore {
     const res = await this.webhookPusher(url, secret, outbound);
     if (res.ok) {
       for (const e of outbound) {
-        this.sql.exec("UPDATE events SET delivered = 1 WHERE id = ?", e.id);
+        if (e.id > 0) {
+          try {
+            this.sql.exec("UPDATE events SET delivered = 1 WHERE id = ?", e.id);
+          } catch (err) {
+            if (!isStorageQuotaError(err)) throw err;
+          }
+        }
       }
     }
   }
@@ -482,7 +678,7 @@ export class FlagshipHubCore {
       id: r.id,
       nodeId: r.node_id,
       kind: r.kind as CommandRecord["kind"],
-      payload: JSON.parse(r.payload_json || "{}"),
+      payload: normalizeRecord(safeJsonParse(r.payload_json, {})),
       status: "claimed",
       result: null,
       createdAt: r.created_at,
@@ -497,81 +693,239 @@ export class FlagshipHubCore {
 
     const now = nowIso();
     const nowMs = Date.now();
-    const helmThreadId = this.getControl("helm_thread_id")?.trim() || null;
+    let storageDegraded = false;
+    let helmThreadId: string | null = null;
+    try {
+      helmThreadId = this.getControl("helm_thread_id")?.trim() || null;
+    } catch (err) {
+      if (!isStorageQuotaError(err)) throw err;
+      storageDegraded = true;
+    }
 
-    const prevNode = this.sql
-      .exec<{ last_seen_at: string }>(
-        "SELECT last_seen_at FROM nodes WHERE node_id = ?",
-        payload.nodeId,
-      )
-      .toArray()[0];
+    const normalizedTelemetry = normalizeTelemetry(payload.telemetry);
+    const normalizedCapabilities = normalizeCapabilities(payload.capabilities ?? []);
+    const normalizedProjects = normalizeProjects(payload.projects ?? []);
+    const normalizedQuota = normalizeQuota(payload.quota ?? {});
+    const environmentId = payload.environmentId ?? null;
+    const owner = payload.owner ?? "default";
+    const platform = payload.platform ?? "unknown";
+    const arch = payload.arch ?? "unknown";
 
-    this.sql.exec(
-      `INSERT INTO nodes (
-        node_id, name, role, environment_id, owner, platform, arch,
-        capabilities_json, projects_json, telemetry_json, quota_json, last_seen_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(node_id) DO UPDATE SET
-        name = excluded.name,
-        role = excluded.role,
-        environment_id = excluded.environment_id,
-        owner = excluded.owner,
-        platform = excluded.platform,
-        arch = excluded.arch,
-        capabilities_json = excluded.capabilities_json,
-        projects_json = excluded.projects_json,
-        telemetry_json = excluded.telemetry_json,
-        quota_json = excluded.quota_json,
-        last_seen_at = excluded.last_seen_at`,
-      payload.nodeId,
+    const capabilitiesJson = JSON.stringify(normalizedCapabilities);
+    const projectsJson = JSON.stringify(normalizedProjects);
+    const quotaJson = JSON.stringify(normalizedQuota);
+    const telemetryJson = JSON.stringify(normalizedTelemetry);
+    const metadataKey = JSON.stringify([
       payload.name,
       payload.role,
-      payload.environmentId ?? null,
-      payload.owner ?? "default",
-      payload.platform ?? "unknown",
-      payload.arch ?? "unknown",
-      JSON.stringify(payload.capabilities ?? []),
-      JSON.stringify(payload.projects ?? []),
-      JSON.stringify(payload.telemetry),
-      JSON.stringify(payload.quota ?? { businessMaxSharePct: 90, spotMinFreeRamPct: 50 }),
-      now,
-    );
+      environmentId,
+      owner,
+      platform,
+      arch,
+      capabilitiesJson,
+      projectsJson,
+      quotaJson,
+    ]);
+    const devicesKey = JSON.stringify(normalizedTelemetry.devices ?? []);
+
+    const liveEntry = this.liveNodes.get(payload.nodeId);
+    let prevNode: NodeRow | null = null;
+    let sqlReadFailed = false;
+    if (!liveEntry) {
+      try {
+        prevNode =
+          this.sql
+            .exec<NodeRow>("SELECT * FROM nodes WHERE node_id = ?", payload.nodeId)
+            .toArray()[0] ?? null;
+      } catch (err) {
+        if (!isStorageQuotaError(err)) throw err;
+        storageDegraded = true;
+        sqlReadFailed = true;
+      }
+    }
+
+    const prevExistsInSql = Boolean(liveEntry || prevNode);
+    const prevLastSeenAt = liveEntry?.record.lastSeenAt ?? prevNode?.last_seen_at ?? null;
+    const prevLastSeenMs = prevLastSeenAt ? Date.parse(prevLastSeenAt) : Number.NaN;
+    const cameOnline =
+      !sqlReadFailed &&
+      (!prevLastSeenAt || !Number.isFinite(prevLastSeenMs) || nowMs - prevLastSeenMs > OFFLINE_NODE_MS);
+
+    const prevMetadataKey = liveEntry
+      ? liveEntry.metadataKey
+      : prevNode
+        ? JSON.stringify([
+            prevNode.name,
+            prevNode.role,
+            prevNode.environment_id ?? null,
+            prevNode.owner,
+            prevNode.platform,
+            prevNode.arch,
+            JSON.stringify(normalizeCapabilities(safeJsonParse(prevNode.capabilities_json, []))),
+            JSON.stringify(normalizeProjects(safeJsonParse(prevNode.projects_json, []))),
+            JSON.stringify(normalizeQuota(safeJsonParse(prevNode.quota_json, {}))),
+          ])
+        : "";
+    const prevTelemetry = prevNode ? normalizeTelemetry(safeJsonParse(prevNode.telemetry_json, {})) : null;
+    const prevActiveThreads = liveEntry ? liveEntry.activeThreads : (prevTelemetry?.activeThreads ?? -1);
+    const prevDevicesKey = liveEntry
+      ? liveEntry.devicesKey
+      : prevTelemetry
+        ? JSON.stringify(prevTelemetry.devices ?? [])
+        : "";
+    const lastPersistedAtMs = liveEntry
+      ? liveEntry.persistedAtMs
+      : Number.isFinite(prevLastSeenMs)
+        ? prevLastSeenMs
+        : 0;
+
+    const shouldPersistNode =
+      !prevExistsInSql ||
+      cameOnline ||
+      metadataKey !== prevMetadataKey ||
+      normalizedTelemetry.activeThreads !== prevActiveThreads ||
+      devicesKey !== prevDevicesKey ||
+      nowMs - lastPersistedAtMs >= NODE_PERSIST_INTERVAL_MS;
+
+    let persistedAtMs = lastPersistedAtMs;
+
+    if (shouldPersistNode && !storageDegraded) {
+      try {
+        this.sql.exec(
+          `INSERT INTO nodes (
+            node_id, name, role, environment_id, owner, platform, arch,
+            capabilities_json, projects_json, telemetry_json, quota_json, last_seen_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(node_id) DO UPDATE SET
+            name = excluded.name,
+            role = excluded.role,
+            environment_id = excluded.environment_id,
+            owner = excluded.owner,
+            platform = excluded.platform,
+            arch = excluded.arch,
+            capabilities_json = excluded.capabilities_json,
+            projects_json = excluded.projects_json,
+            telemetry_json = excluded.telemetry_json,
+            quota_json = excluded.quota_json,
+            last_seen_at = excluded.last_seen_at`,
+          payload.nodeId,
+          payload.name,
+          payload.role,
+          environmentId,
+          owner,
+          platform,
+          arch,
+          capabilitiesJson,
+          projectsJson,
+          telemetryJson,
+          quotaJson,
+          now,
+        );
+        persistedAtMs = nowMs;
+      } catch (err) {
+        if (!isStorageQuotaError(err)) throw err;
+        storageDegraded = true;
+      }
+    }
+
+    const liveNodeRecord: NodeRecord = {
+      nodeId: payload.nodeId,
+      name: payload.name,
+      role: payload.role,
+      environmentId,
+      owner,
+      platform,
+      arch,
+      capabilities: normalizedCapabilities,
+      projects: normalizedProjects,
+      telemetry: normalizedTelemetry,
+      quota: normalizedQuota,
+      status: "online",
+      lastSeenAt: now,
+    };
+    this.liveNodes.set(payload.nodeId, {
+      record: liveNodeRecord,
+      persistedAtMs,
+      metadataKey,
+      activeThreads: normalizedTelemetry.activeThreads,
+      devicesKey,
+    });
 
     const newEvents: FleetEvent[] = [];
+    const safeRecordEvent = (
+      kind: string,
+      nodeId: string | null,
+      threadId: string | null,
+      summary: string,
+      eventPayload: Record<string, unknown> = {},
+    ): FleetEvent => {
+      if (storageDegraded) {
+        return {
+          id: 0,
+          kind,
+          nodeId,
+          threadId,
+          summary,
+          payload: eventPayload,
+          delivered: false,
+          createdAt: now,
+        };
+      }
+      try {
+        return this.recordEvent(kind, nodeId, threadId, summary, eventPayload);
+      } catch (err) {
+        if (!isStorageQuotaError(err)) throw err;
+        storageDegraded = true;
+        return {
+          id: 0,
+          kind,
+          nodeId,
+          threadId,
+          summary,
+          payload: eventPayload,
+          delivered: false,
+          createdAt: now,
+        };
+      }
+    };
 
-    if (!prevNode || nowMs - Date.parse(prevNode.last_seen_at) > OFFLINE_NODE_MS) {
+    if (cameOnline) {
       newEvents.push(
-        this.recordEvent(
+        safeRecordEvent(
           "node_online",
           payload.nodeId,
           null,
-          `${payload.name} (${payload.role}) came online with ${payload.telemetry.ramFreeMb}MB RAM free.`,
-          { role: payload.role, ramFreeMb: payload.telemetry.ramFreeMb },
+          `${payload.name} (${payload.role}) came online with ${normalizedTelemetry.ramFreeMb}MB RAM free.`,
+          { role: payload.role, ramFreeMb: normalizedTelemetry.ramFreeMb },
         ),
       );
     }
 
     // Reconcile observed T3 threads & detect state transitions
-    if (Array.isArray(payload.threads)) {
+    if (Array.isArray(payload.threads) && payload.threads.length > 0) {
+      let existingSqlRows: ThreadRow[] = [];
+      if (!storageDegraded) {
+        try {
+          existingSqlRows = this.sql
+            .exec<ThreadRow>("SELECT * FROM threads WHERE node_id = ?", payload.nodeId)
+            .toArray();
+        } catch (err) {
+          if (!isStorageQuotaError(err)) throw err;
+          storageDegraded = true;
+        }
+      }
+      const sqlByThreadId = new Map<string, ThreadRow>(
+        existingSqlRows.map((r) => [r.thread_id, r]),
+      );
+
       for (const th of payload.threads) {
         if (!th.threadId) continue;
-        const prev = this.sql
-          .exec<{
-            status: string;
-            item_count: number;
-            last_progress_at: string;
-            stalled: number;
-            updated_at: string;
-            dismissed_at: string | null;
-          }>(
-            "SELECT status, item_count, last_progress_at, stalled, updated_at, dismissed_at FROM threads WHERE node_id = ? AND thread_id = ?",
-            payload.nodeId,
-            th.threadId,
-          )
-          .toArray()[0];
+        const threadKey = `${payload.nodeId}:${th.threadId}`;
+        const sqlPrev = sqlByThreadId.get(th.threadId);
+        const prev = this.liveThreads.get(threadKey) ?? sqlPrev;
 
         const itemCount = th.itemCount ?? 0;
-        const updatedAt = th.updatedAt ?? now;
+        const updatedAt = th.updatedAt ?? prev?.updated_at ?? now;
         const progressed =
           !prev ||
           itemCount !== prev.item_count ||
@@ -579,46 +933,81 @@ export class FlagshipHubCore {
           updatedAt !== prev.updated_at;
         const lastProgressAt = progressed ? now : prev.last_progress_at;
         const isActive = th.status === "running" || th.status === "starting";
+        const lastProgressMs = Date.parse(lastProgressAt);
         const stalled =
-          isActive && !th.settled && nowMs - Date.parse(lastProgressAt) > STALL_THREAD_MS;
+          isActive &&
+          !th.settled &&
+          Number.isFinite(lastProgressMs) &&
+          nowMs - lastProgressMs > STALL_THREAD_MS;
         // Clear any prior dismissal automatically once a thread runs again
         const dismissedAt = isActive ? null : (prev?.dismissed_at ?? null);
 
-        this.sql.exec(
-          `INSERT INTO threads (
-            node_id, thread_id, project_id, project_title, project_path, title, link,
-            status, settled, snoozed, item_count, updated_at, last_progress_at, stalled, dismissed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(node_id, thread_id) DO UPDATE SET
-            project_id = excluded.project_id,
-            project_title = excluded.project_title,
-            project_path = excluded.project_path,
-            title = excluded.title,
-            link = excluded.link,
-            status = excluded.status,
-            settled = excluded.settled,
-            snoozed = excluded.snoozed,
-            item_count = excluded.item_count,
-            updated_at = excluded.updated_at,
-            last_progress_at = excluded.last_progress_at,
-            stalled = excluded.stalled,
-            dismissed_at = excluded.dismissed_at`,
-          payload.nodeId,
-          th.threadId,
-          th.projectId ?? null,
-          th.projectTitle ?? null,
-          th.projectPath ?? null,
-          th.title || "(untitled)",
-          th.link ?? null,
-          th.status,
-          th.settled ? 1 : 0,
-          th.snoozed ? 1 : 0,
-          itemCount,
-          updatedAt,
-          lastProgressAt,
-          stalled ? 1 : 0,
-          dismissedAt,
-        );
+        const nextRow: ThreadRow = {
+          node_id: payload.nodeId,
+          thread_id: th.threadId,
+          project_id: th.projectId ?? null,
+          project_title: th.projectTitle ?? null,
+          project_path: th.projectPath ?? null,
+          title: th.title || "(untitled)",
+          link: th.link ?? null,
+          status: th.status,
+          settled: th.settled ? 1 : 0,
+          snoozed: th.snoozed ? 1 : 0,
+          item_count: itemCount,
+          updated_at: updatedAt,
+          last_progress_at: lastProgressAt,
+          stalled: stalled ? 1 : 0,
+          dismissed_at: dismissedAt,
+        };
+
+        if (storageDegraded) {
+          this.liveThreads.set(threadKey, nextRow);
+        } else if (this.threadRowChanged(sqlPrev, nextRow)) {
+          try {
+            this.sql.exec(
+              `INSERT INTO threads (
+                node_id, thread_id, project_id, project_title, project_path, title, link,
+                status, settled, snoozed, item_count, updated_at, last_progress_at, stalled, dismissed_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(node_id, thread_id) DO UPDATE SET
+                project_id = excluded.project_id,
+                project_title = excluded.project_title,
+                project_path = excluded.project_path,
+                title = excluded.title,
+                link = excluded.link,
+                status = excluded.status,
+                settled = excluded.settled,
+                snoozed = excluded.snoozed,
+                item_count = excluded.item_count,
+                updated_at = excluded.updated_at,
+                last_progress_at = excluded.last_progress_at,
+                stalled = excluded.stalled,
+                dismissed_at = excluded.dismissed_at`,
+              nextRow.node_id,
+              nextRow.thread_id,
+              nextRow.project_id,
+              nextRow.project_title,
+              nextRow.project_path,
+              nextRow.title,
+              nextRow.link,
+              nextRow.status,
+              nextRow.settled,
+              nextRow.snoozed,
+              nextRow.item_count,
+              nextRow.updated_at,
+              nextRow.last_progress_at,
+              nextRow.stalled,
+              nextRow.dismissed_at,
+            );
+            this.liveThreads.delete(threadKey);
+          } catch (err) {
+            if (!isStorageQuotaError(err)) throw err;
+            storageDegraded = true;
+            this.liveThreads.set(threadKey, nextRow);
+          }
+        } else {
+          this.liveThreads.delete(threadKey);
+        }
 
         // Suppress self-wakeup events for the Helm Home thread itself
         if (helmThreadId && th.threadId === helmThreadId) {
@@ -632,13 +1021,20 @@ export class FlagshipHubCore {
             (prev.status === "running" || prev.status === "starting" || prev.status === "queued") &&
             (th.status === "completed" || th.status === "idle")
           ) {
-            this.sql.exec(
-              "UPDATE ideas SET status = 'done', updated_at = ? WHERE thread_id = ? AND status = 'dispatched'",
-              now,
-              th.threadId,
-            );
+            if (!storageDegraded) {
+              try {
+                this.sql.exec(
+                  "UPDATE ideas SET status = 'done', updated_at = ? WHERE thread_id = ? AND status = 'dispatched'",
+                  now,
+                  th.threadId,
+                );
+              } catch (err) {
+                if (!isStorageQuotaError(err)) throw err;
+                storageDegraded = true;
+              }
+            }
             newEvents.push(
-              this.recordEvent(
+              safeRecordEvent(
                 "thread_completed",
                 payload.nodeId,
                 th.threadId,
@@ -648,7 +1044,7 @@ export class FlagshipHubCore {
             );
           } else if (th.status === "failed" || th.status === "interrupted") {
             newEvents.push(
-              this.recordEvent(
+              safeRecordEvent(
                 "thread_failed",
                 payload.nodeId,
                 th.threadId,
@@ -658,7 +1054,7 @@ export class FlagshipHubCore {
             );
           } else if (th.status === "waiting") {
             newEvents.push(
-              this.recordEvent(
+              safeRecordEvent(
                 "thread_needs_input",
                 payload.nodeId,
                 th.threadId,
@@ -669,7 +1065,7 @@ export class FlagshipHubCore {
           }
         } else if (prev && !prev.stalled && stalled) {
           newEvents.push(
-            this.recordEvent(
+            safeRecordEvent(
               "thread_stalled",
               payload.nodeId,
               th.threadId,
@@ -681,10 +1077,33 @@ export class FlagshipHubCore {
       }
     }
 
-    await this.maybePushWebhook(newEvents);
+    if (!storageDegraded) {
+      await this.maybePushWebhook(newEvents);
+    }
 
-    const { standDown, reason } = this.isStandDown();
-    const pendingCommands = standDown ? [] : this.claimPendingCommands(payload.nodeId);
+    let standDown = false;
+    let reason: string | null = null;
+    if (!storageDegraded) {
+      try {
+        const sd = this.isStandDown();
+        standDown = sd.standDown;
+        reason = sd.reason;
+      } catch (err) {
+        if (!isStorageQuotaError(err)) throw err;
+        storageDegraded = true;
+      }
+    }
+
+    let pendingCommands: CommandRecord[] = [];
+    if (!standDown && !storageDegraded) {
+      try {
+        pendingCommands = this.claimPendingCommands(payload.nodeId);
+      } catch (err) {
+        if (!isStorageQuotaError(err)) throw err;
+        storageDegraded = true;
+        pendingCommands = [];
+      }
+    }
 
     return this.json({
       ok: true,
@@ -693,6 +1112,12 @@ export class FlagshipHubCore {
       standDownReason: reason,
       eventsRecorded: newEvents.length,
       pendingCommands,
+      ...(storageDegraded
+        ? {
+            storageDegraded: true,
+            storageWarning: "Durable Object daily write quota exceeded; heartbeat cached in memory.",
+          }
+        : {}),
     });
   }
 
@@ -1063,12 +1488,30 @@ export class FlagshipHubCore {
   }
 
   private getOverview(): OverviewResponse {
-    const nodes = this.listNodes();
-    const threads = this.listThreads();
-    const ideas = this.listIdeas();
-    const openAlerts = this.listAlerts("open,working");
-    const recentEvents = this.listEvents(20);
-    const { standDown, reason } = this.isStandDown();
+    const nodesRes = this.listNodes(true);
+    const threadsRes = this.listThreads(true);
+    let storageDegraded = nodesRes.degraded || threadsRes.degraded;
+
+    const safeRead = <T>(fn: () => T, fallback: T): T => {
+      if (storageDegraded) return fallback;
+      try {
+        return fn();
+      } catch (err) {
+        if (!isStorageQuotaError(err)) throw err;
+        storageDegraded = true;
+        return fallback;
+      }
+    };
+
+    const nodes = nodesRes.nodes;
+    const threads = threadsRes.threads;
+    const ideas = safeRead(() => this.listIdeas(), [] as IdeaRecord[]);
+    const openAlerts = safeRead(() => this.listAlerts("open,working"), [] as AlertRecord[]);
+    const recentEvents = safeRead(() => this.listEvents(20), [] as FleetEvent[]);
+    const { standDown, reason } = safeRead(
+      () => this.isStandDown(),
+      { standDown: false, reason: null },
+    );
 
     const activeStatuses = new Set(["running", "starting", "queued", "preparing"]);
     const recentFailCutoffMs = Date.now() - 24 * 60 * 60_000;
@@ -1083,14 +1526,25 @@ export class FlagshipHubCore {
       }
       return false;
     });
-    const pendingCommandsRow = this.sql
-      .exec<{ c: number }>("SELECT COUNT(*) AS c FROM commands WHERE status = 'pending'")
-      .toArray()[0];
+    const pendingCommandsRow = safeRead(
+      () =>
+        this.sql
+          .exec<{ c: number }>("SELECT COUNT(*) AS c FROM commands WHERE status = 'pending'")
+          .toArray()[0],
+      undefined,
+    );
 
     return {
       generatedAt: nowIso(),
       standDown,
       standDownReason: reason,
+      ...(storageDegraded
+        ? {
+            storageDegraded: true,
+            storageWarning:
+              "Durable Object SQLite free-tier daily quota exceeded (resets at 00:00 UTC); showing live in-memory fleet telemetry.",
+          }
+        : {}),
       counts: {
         nodesOnline: nodes.filter((n) => n.status === "online").length,
         nodesTotal: nodes.length,
@@ -1130,6 +1584,11 @@ export class FlagshipHubCore {
         "UPDATE threads SET dismissed_at = ? WHERE status IN ('failed', 'interrupted') AND dismissed_at IS NULL",
         now,
       );
+      for (const [key, row] of this.liveThreads.entries()) {
+        if ((row.status === "failed" || row.status === "interrupted") && !row.dismissed_at) {
+          this.liveThreads.set(key, { ...row, dismissed_at: now });
+        }
+      }
       return {
         ok: true,
         mode: "allFailed",
@@ -1160,12 +1619,21 @@ export class FlagshipHubCore {
         nodeId,
         threadId,
       );
+      const live = this.liveThreads.get(`${nodeId}:${threadId}`);
+      if (live) {
+        this.liveThreads.set(`${nodeId}:${threadId}`, { ...live, dismissed_at: now });
+      }
     } else {
       this.sql.exec(
         "UPDATE threads SET dismissed_at = ? WHERE thread_id = ?",
         now,
         threadId,
       );
+      for (const [key, row] of this.liveThreads.entries()) {
+        if (row.thread_id === threadId) {
+          this.liveThreads.set(key, { ...row, dismissed_at: now });
+        }
+      }
     }
 
     return {
@@ -1279,7 +1747,7 @@ export class FlagshipHubCore {
     const prompt = String(body.prompt ?? title).trim();
     if (!title) throw new Error("title is required");
 
-    const decision = routeTask(this.listNodes(), {
+    const decision = routeTask(this.listNodes().nodes, {
       title,
       description: prompt,
       workload: body.workload as RouteRequest["workload"],
@@ -1402,7 +1870,7 @@ export class FlagshipHubCore {
       MAX_FINISHED_COMMANDS,
     );
 
-    const payload = JSON.parse(rows[0].payload_json || "{}");
+    const payload = normalizeRecord(safeJsonParse(rows[0].payload_json, {}));
     const threadId = typeof body.threadId === "string" ? body.threadId : null;
     const threadLink = typeof body.threadLink === "string" ? body.threadLink : null;
 
@@ -1439,7 +1907,7 @@ export class FlagshipHubCore {
       case "flagship_overview":
         return this.getOverview();
       case "flagship_route":
-        return routeTask(this.listNodes(), args as unknown as RouteRequest);
+        return routeTask(this.listNodes(true).nodes, args as unknown as RouteRequest);
       case "flagship_idea_add":
         return this.createIdea(args);
       case "flagship_idea_update":
@@ -1478,18 +1946,32 @@ export class FlagshipHubCore {
   }
 
   async fetch(request: Request): Promise<Response> {
-    this.ensureSchema();
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
+    const supportsLiveQuotaFallback =
+      (path === "/api/nodes/heartbeat" && method === "POST") ||
+      (path === "/api/nodes" && method === "GET") ||
+      (path === "/api/overview" && method === "GET") ||
+      (path === "/api/route" && method === "POST") ||
+      (path === "/mcp" && method === "POST");
 
     try {
+      try {
+        this.ensureSchema();
+      } catch (err) {
+        if (!supportsLiveQuotaFallback || !isStorageQuotaError(err)) {
+          throw err;
+        }
+      }
+
       if (path === "/api/nodes/heartbeat" && method === "POST") {
         return await this.handleHeartbeat((await request.json()) as HeartbeatPayload);
       }
 
       if (path === "/api/nodes" && method === "GET") {
-        return this.json({ nodes: this.listNodes() });
+        const { nodes, degraded } = this.listNodes(true);
+        return this.json({ nodes, ...(degraded ? { storageDegraded: true } : {}) });
       }
 
       if (path === "/api/overview" && method === "GET") {
@@ -1498,7 +1980,7 @@ export class FlagshipHubCore {
 
       if (path === "/api/route" && method === "POST") {
         const body = (await request.json()) as RouteRequest;
-        return this.json(routeTask(this.listNodes(), body));
+        return this.json(routeTask(this.listNodes(true).nodes, body));
       }
 
       if (path === "/api/ideas" && method === "GET") {
@@ -1630,6 +2112,15 @@ export class FlagshipHubCore {
 
       return this.json({ error: `Not found: ${method} ${path}` }, 404);
     } catch (err) {
+      if (isStorageQuotaError(err)) {
+        return this.json(
+          {
+            error: err instanceof Error ? err.message : String(err),
+            code: "STORAGE_QUOTA_EXCEEDED",
+          },
+          503,
+        );
+      }
       const status = err instanceof NotFoundError ? err.status : 400;
       return this.json(
         { error: err instanceof Error ? err.message : String(err) },

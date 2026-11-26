@@ -1,3 +1,4 @@
+import { isStorageQuotaError } from "./core";
 import { FlagshipHub } from "./state";
 import type { Env } from "./types";
 
@@ -68,6 +69,20 @@ export default {
 
     const id = env.FLAGSHIP_HUB.idFromName("primary");
     const stub = env.FLAGSHIP_HUB.get(id);
-    return stub.fetch(request);
+    try {
+      return await stub.fetch(request);
+    } catch (err) {
+      const quotaExceeded = isStorageQuotaError(err);
+      return new Response(
+        JSON.stringify({
+          error: err instanceof Error ? err.message : String(err),
+          code: quotaExceeded ? "STORAGE_QUOTA_EXCEEDED" : "HUB_UNAVAILABLE",
+        }),
+        {
+          status: 503,
+          headers: { "Content-Type": "application/json; charset=utf-8", ...cors },
+        },
+      );
+    }
   },
 };

@@ -71,6 +71,9 @@ def print_overview(data: dict[str, Any]) -> None:
     print(f"=== FLAGSHIP OVERVIEW [{banner}] ===")
     if data.get("standDown") and data.get("standDownReason"):
         print(f"Paused: {data['standDownReason']}")
+    if data.get("storageDegraded"):
+        warn = data.get("storageWarning") or "Hub storage temporarily degraded; showing live in-memory fleet state."
+        print(f"Warning: {warn}")
     print(
         f"Nodes: {counts.get('nodesOnline', 0)}/{counts.get('nodesTotal', 0)} online | "
         f"Active threads: {counts.get('threadsActive', 0)} | "

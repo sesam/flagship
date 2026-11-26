@@ -607,3 +607,222 @@ describe("FlagshipHubCore proactive Discord alerts", () => {
     expect((postRes.data.alert as { alertKey: string }).alertKey).toBe("legacy:upgrade:test");
   });
 });
+
+describe("FlagshipHubCore DO write-quota protection and corrupt-row resilience", () => {
+  it("skips redundant thread and node SQL writes on unchanged heartbeats while serving live telemetry", async () => {
+    const db = new DatabaseSync(":memory:");
+    const baseSql = createSqliteAdapter(db);
+    const writeQueries: string[] = [];
+    const countingSql: SqlStorageLike = {
+      exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]) {
+        const upper = query.trim().toUpperCase();
+        if (!upper.startsWith("SELECT") && !upper.startsWith("PRAGMA")) {
+          writeQueries.push(query.trim());
+        }
+        return baseSql.exec<T>(query, ...bindings);
+      },
+    };
+
+    const hub = new FlagshipHubCore(countingSql, "0.1.0", async () => ({ ok: true }));
+    const now = new Date().toISOString();
+    const threads = Array.from({ length: 15 }, (_, idx) => ({
+      threadId: `th-${idx}`,
+      title: `Thread ${idx}`,
+      status: idx === 0 ? "running" : "idle",
+      settled: idx > 5,
+      snoozed: false,
+      itemCount: idx + 1,
+      updatedAt: now,
+    }));
+
+    // Initial baseline heartbeat writes node + 15 threads + node_online event
+    await reqJson(hub, "/api/nodes/heartbeat", "POST", makeHeartbeat(threads));
+    writeQueries.length = 0;
+
+    // Next 5 heartbeats with slightly different RAM/load and identical threads: 0 SQL writes!
+    for (let i = 1; i <= 5; i++) {
+      const hb = makeHeartbeat(threads);
+      hb.telemetry.ramFreeMb = 9000 - i * 50;
+      hb.telemetry.load1m = 0.6 + i * 0.1;
+      const res = await reqJson(hub, "/api/nodes/heartbeat", "POST", hb);
+      expect(res.status).toBe(200);
+    }
+    expect(writeQueries).toHaveLength(0);
+
+    // Overview still reflects the latest live in-memory telemetry
+    const ov = (await reqJson(hub, "/api/overview")).data as unknown as OverviewResponse;
+    expect(ov.nodes[0].telemetry.ramFreeMb).toBe(8750);
+    expect(ov.nodes[0].telemetry.load1m).toBeCloseTo(1.1, 2);
+
+    // Changing 1 thread status writes ONLY that thread (plus idea auto-close + event), not the other 14
+    const updatedThreads = threads.map((t) =>
+      t.threadId === "th-0" ? { ...t, status: "completed", itemCount: 2 } : t,
+    );
+    await reqJson(hub, "/api/nodes/heartbeat", "POST", makeHeartbeat(updatedThreads));
+    const threadWrites = writeQueries.filter((q) => q.includes("INTO threads"));
+    expect(threadWrites).toHaveLength(1);
+  });
+
+  it("serves cold-start reads and degrades heartbeats cleanly when DO free-tier write quota is exhausted", async () => {
+    const db = new DatabaseSync(":memory:");
+    const baseSql = createSqliteAdapter(db);
+
+    // Seed an initialized DB with normal data
+    const setupHub = new FlagshipHubCore(baseSql, "0.1.0", async () => ({ ok: true }));
+    await reqJson(
+      setupHub,
+      "/api/nodes/heartbeat",
+      "POST",
+      makeHeartbeat([{ threadId: "t-live-1", title: "Live worker", status: "running", itemCount: 2 }]),
+    );
+    await reqJson(setupHub, "/api/ideas", "POST", { title: "Existing idea", priority: "P1" });
+
+    // Simulate Cloudflare DO free-tier daily rows-written quota exhausted on a cold DO instance
+    const writeBlockedSql: SqlStorageLike = {
+      exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]) {
+        const upper = query.trim().toUpperCase();
+        if (!upper.startsWith("SELECT") && !upper.startsWith("PRAGMA")) {
+          throw new Error("Exceeded allowed rows written in Durable Objects free tier.");
+        }
+        return baseSql.exec<T>(query, ...bindings);
+      },
+    };
+
+    const coldHub = new FlagshipHubCore(writeBlockedSql, "0.1.0", async () => ({ ok: true }));
+
+    // Cold-start GET /api/overview must NOT run DDL/writes and must return 200 OK
+    const ovRes = await reqJson(coldHub, "/api/overview");
+    expect(ovRes.status).toBe(200);
+    const ov = ovRes.data as unknown as OverviewResponse;
+    expect(ov.nodes).toHaveLength(1);
+    expect(ov.ideas).toHaveLength(1);
+    expect(ov.inFlight).toHaveLength(1);
+
+    // Heartbeat during quota exhaustion caches live telemetry in memory without crashing
+    const hb = makeHeartbeat([
+      { threadId: "t-live-1", title: "Live worker", status: "running", itemCount: 5 },
+    ]);
+    hb.telemetry.ramFreeMb = 7777;
+    const hbRes = await reqJson(coldHub, "/api/nodes/heartbeat", "POST", hb);
+    expect(hbRes.status).toBe(200);
+    expect(hbRes.data.ok).toBe(true);
+    expect(hbRes.data.storageDegraded).toBe(true);
+
+    const ovAfterHb = (await reqJson(coldHub, "/api/overview")).data as unknown as OverviewResponse;
+    expect(ovAfterHb.nodes[0].telemetry.ramFreeMb).toBe(7777);
+    expect(ovAfterHb.inFlight[0].itemCount).toBe(5);
+
+    // Durable mutations return structured 503 JSON instead of crashing with uncaught error
+    const ideaRes = await reqJson(coldHub, "/api/ideas", "POST", { title: "New idea during quota outage" });
+    expect(ideaRes.status).toBe(503);
+    expect(ideaRes.data.code).toBe("STORAGE_QUOTA_EXCEEDED");
+  });
+
+  it("stays operational in-memory when all SQL calls (reads + writes) throw free-tier quota error, and auto-heals after reset", async () => {
+    const db = new DatabaseSync(":memory:");
+    const baseSql = createSqliteAdapter(db);
+    let quotaBlocked = true;
+
+    const toggleableSql: SqlStorageLike = {
+      exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]) {
+        if (quotaBlocked) {
+          throw new Error("Exceeded allowed rows written in Durable Objects free tier.");
+        }
+        return baseSql.exec<T>(query, ...bindings);
+      },
+    };
+
+    const hub = new FlagshipHubCore(toggleableSql, "0.1.0", async () => ({ ok: true }));
+
+    // Cold-start overview during full SQLite quota block still returns 200 with storageDegraded: true
+    const ovEmpty = await reqJson(hub, "/api/overview");
+    expect(ovEmpty.status).toBe(200);
+    expect(ovEmpty.data.storageDegraded).toBe(true);
+
+    // Heartbeat populates live in-memory nodes and threads without crashing
+    const hb = makeHeartbeat([
+      { threadId: "t-degraded-1", title: "Live task", status: "running", itemCount: 3 },
+    ]);
+    hb.telemetry.ramFreeMb = 8888;
+    const hbRes = await reqJson(hub, "/api/nodes/heartbeat", "POST", hb);
+    expect(hbRes.status).toBe(200);
+    expect(hbRes.data.storageDegraded).toBe(true);
+
+    // Overview and route immediately reflect the live node & thread
+    const ovLive = (await reqJson(hub, "/api/overview")).data as unknown as OverviewResponse;
+    expect(ovLive.storageDegraded).toBe(true);
+    expect(ovLive.counts.nodesOnline).toBe(1);
+    expect(ovLive.nodes[0].telemetry.ramFreeMb).toBe(8888);
+    expect(ovLive.inFlight).toHaveLength(1);
+
+    const routeRes = await reqJson(hub, "/api/route", "POST", { title: "Research pricing" });
+    expect(routeRes.status).toBe(200);
+    expect((routeRes.data.selectedNode as { nodeId: string }).nodeId).toBe("cloud-vm");
+
+    // Durable mutations honestly return 503 STORAGE_QUOTA_EXCEEDED
+    const ideaBlocked = await reqJson(hub, "/api/ideas", "POST", { title: "Blocked idea" });
+    expect(ideaBlocked.status).toBe(503);
+    expect(ideaBlocked.data.code).toBe("STORAGE_QUOTA_EXCEEDED");
+
+    // Simulate 00:00 UTC quota reset -> hub auto-heals on next request and persists to SQLite
+    quotaBlocked = false;
+    const hbRecovered = await reqJson(hub, "/api/nodes/heartbeat", "POST", hb);
+    expect(hbRecovered.status).toBe(200);
+    expect(hbRecovered.data.storageDegraded).toBeUndefined();
+
+    const ideaOk = await reqJson(hub, "/api/ideas", "POST", { title: "Persisted after reset" });
+    expect(ideaOk.status).toBe(201);
+
+    const ovRecovered = (await reqJson(hub, "/api/overview")).data as unknown as OverviewResponse;
+    expect(ovRecovered.storageDegraded).toBeUndefined();
+    expect(ovRecovered.nodes).toHaveLength(1);
+    expect(ovRecovered.ideas).toHaveLength(1);
+  });
+
+  it("handles corrupt JSON columns and partial telemetry rows without crashing overview or routing", async () => {
+    const db = new DatabaseSync(":memory:");
+    const baseSql = createSqliteAdapter(db);
+    const hub = new FlagshipHubCore(baseSql, "0.1.0", async () => ({ ok: true }));
+
+    // Initialize schema via a read
+    await reqJson(hub, "/api/overview");
+
+    // Inject corrupt rows directly into SQLite
+    db.prepare(
+      `INSERT INTO nodes (
+        node_id, name, role, environment_id, owner, platform, arch,
+        capabilities_json, projects_json, telemetry_json, quota_json, last_seen_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "corrupt-node",
+      "Corrupt Node",
+      "vm",
+      null,
+      "ops",
+      "linux",
+      "x64",
+      "{not-valid-json",
+      "null",
+      "{broken-telemetry",
+      "broken-quota",
+      "not-a-timestamp",
+    );
+    db.prepare(
+      `INSERT INTO events (kind, node_id, thread_id, summary, payload_json, delivered, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run("test_event", "corrupt-node", null, "Corrupt payload event", "{bad-json", 0, new Date().toISOString());
+
+    const ovRes = await reqJson(hub, "/api/overview");
+    expect(ovRes.status).toBe(200);
+    const ov = ovRes.data as unknown as OverviewResponse;
+    expect(ov.nodes).toHaveLength(1);
+    expect(ov.nodes[0].status).toBe("offline");
+    expect(ov.nodes[0].telemetry.load1m).toBe(0);
+    expect(ov.nodes[0].capabilities).toEqual([]);
+    expect(ov.nodes[0].projects).toEqual([]);
+    expect(ov.recentEvents[0].payload).toEqual({});
+
+    const routeRes = await reqJson(hub, "/api/route", "POST", { title: "Check routing with corrupt row" });
+    expect(routeRes.status).toBe(200);
+  });
+});
