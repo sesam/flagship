@@ -264,3 +264,254 @@ describe("FlagshipHubCore security controls", () => {
     expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
   });
 });
+
+describe("FlagshipHubCore proactive Discord alerts", () => {
+  it("ingests alerts, pushes discord_alert webhook, dedupes active/cooldown alerts, and re-opens after cooldown", async () => {
+    const db = new DatabaseSync(":memory:");
+    const pushedBatches: FleetEvent[][] = [];
+    const hub = new FlagshipHubCore(createSqliteAdapter(db), "0.1.0", async (_url, _secret, events) => {
+      pushedBatches.push(events);
+      return { ok: true, status: 200 };
+    });
+
+    await reqJson(hub, "/api/control/webhook", "POST", {
+      url: "https://t3.test/hooks/helm",
+    });
+
+    // 1. Fresh alert ingest -> 201 + discord_alert webhook push
+    const first = await reqJson(hub, "/api/alerts", "POST", {
+      alertKey: "frontend:missing-prime-icon:pi-bolt",
+      repo: "FRONTEND",
+      channelId: "111222333444555666",
+      messageId: "999888777666555444",
+      source: "notify-discord",
+      severity: "bug",
+      summary: "PrimeIcons glyph missing: pi-bolt",
+      text: "PrimeIcons glyph missing on /app icon: pi-bolt",
+      silentFirst: false,
+    });
+    expect(first.status).toBe(201);
+    expect(first.data.ok).toBe(true);
+    expect(first.data.deduped).toBe(false);
+    expect((first.data.alert as { status: string; hitCount: number }).status).toBe("open");
+    expect((first.data.alert as { hitCount: number }).hitCount).toBe(1);
+    expect(pushedBatches).toHaveLength(1);
+    expect(pushedBatches[0][0].kind).toBe("discord_alert");
+    expect(pushedBatches[0][0].summary).toBe("[Alert] (FRONTEND) PrimeIcons glyph missing: pi-bolt");
+    expect(pushedBatches[0][0].payload).toMatchObject({
+      alertKey: "frontend:missing-prime-icon:pi-bolt",
+      repo: "FRONTEND",
+      channelId: "111222333444555666",
+      messageId: "999888777666555444",
+      severity: "bug",
+      silentFirst: false,
+    });
+
+    // Overview exposes openAlerts + counts.openAlerts
+    const ov = (await reqJson(hub, "/api/overview")).data as unknown as OverviewResponse;
+    expect(ov.counts.openAlerts).toBe(1);
+    expect(ov.openAlerts).toHaveLength(1);
+    expect(ov.openAlerts[0].alertKey).toBe("frontend:missing-prime-icon:pi-bolt");
+
+    // 2. Duplicate while open -> 200 deduped, hitCount++, updates messageId, NO webhook push
+    const dupOpen = await reqJson(hub, "/api/alerts", "POST", {
+      alertKey: "frontend:missing-prime-icon:pi-bolt",
+      repo: "FRONTEND",
+      channelId: "111222333444555666",
+      messageId: "999888777666555445",
+      summary: "PrimeIcons glyph missing: pi-bolt",
+    });
+    expect(dupOpen.status).toBe(200);
+    expect(dupOpen.data.deduped).toBe(true);
+    expect((dupOpen.data.alert as { hitCount: number; messageId: string }).hitCount).toBe(2);
+    expect((dupOpen.data.alert as { messageId: string }).messageId).toBe("999888777666555445");
+    expect(pushedBatches).toHaveLength(1);
+
+    // 3. Mark working, then duplicate -> still deduped, NO webhook push
+    await reqJson(
+      hub,
+      `/api/alerts/${encodeURIComponent("frontend:missing-prime-icon:pi-bolt")}`,
+      "PATCH",
+      { status: "working", threadId: "th_fix_1", threadLink: "https://app.t3.codes/t/1" },
+    );
+    const dupWorking = await reqJson(hub, "/api/alerts", "POST", {
+      alertKey: "frontend:missing-prime-icon:pi-bolt",
+      summary: "PrimeIcons glyph missing: pi-bolt",
+    });
+    expect(dupWorking.status).toBe(200);
+    expect(dupWorking.data.deduped).toBe(true);
+    expect((dupWorking.data.alert as { hitCount: number; status: string }).hitCount).toBe(3);
+    expect((dupWorking.data.alert as { status: string }).status).toBe("working");
+    expect(pushedBatches).toHaveLength(1);
+
+    // 4. Mark resolved -> deduped within default 6h cooldown
+    await reqJson(
+      hub,
+      `/api/alerts/${encodeURIComponent("frontend:missing-prime-icon:pi-bolt")}`,
+      "PATCH",
+      { status: "resolved", note: "Fixed in abc123" },
+    );
+    const dupCooldown = await reqJson(hub, "/api/alerts", "POST", {
+      alertKey: "frontend:missing-prime-icon:pi-bolt",
+      summary: "PrimeIcons glyph missing: pi-bolt",
+    });
+    expect(dupCooldown.status).toBe(200);
+    expect(dupCooldown.data.deduped).toBe(true);
+    expect((dupCooldown.data.alert as { hitCount: number; status: string }).hitCount).toBe(4);
+    expect((dupCooldown.data.alert as { status: string }).status).toBe("resolved");
+    expect(pushedBatches).toHaveLength(1);
+
+    // 5. Re-open once outside cooldown (cooldownSeconds: 0) -> 201 + webhook push again
+    const reopened = await reqJson(hub, "/api/alerts", "POST", {
+      alertKey: "frontend:missing-prime-icon:pi-bolt",
+      repo: "FRONTEND",
+      summary: "PrimeIcons glyph missing: pi-bolt (regression)",
+      cooldownSeconds: 0,
+    });
+    expect(reopened.status).toBe(201);
+    expect(reopened.data.deduped).toBe(false);
+    expect((reopened.data.alert as { status: string; hitCount: number; threadId: string | null }).status).toBe("open");
+    expect((reopened.data.alert as { hitCount: number }).hitCount).toBe(1);
+    expect((reopened.data.alert as { threadId: string | null }).threadId).toBeNull();
+    expect(pushedBatches).toHaveLength(2);
+
+    // 6. Stand-down suppresses webhook push while still storing the alert
+    await reqJson(hub, "/api/control/stand-down", "POST", { reason: "quiet hours" });
+    const duringStandDown = await reqJson(hub, "/api/alerts", "POST", {
+      alertKey: "backend:slow-query:orders",
+      repo: "BACKEND",
+      summary: "Slow query on orders",
+    });
+    expect(duringStandDown.status).toBe(201);
+    expect(pushedBatches).toHaveLength(2);
+  });
+
+  it("calls notify-discord /alert/status on PATCH, handles errors gracefully, filters GET /api/alerts, and exposes MCP tools", async () => {
+    const db = new DatabaseSync(":memory:");
+    const notifyCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    let nextNotifyResponse: () => Promise<Response> = async () =>
+      new Response(JSON.stringify({ ok: true }), { status: 200 });
+
+    const mockFetch: typeof fetch = async (input, init) => {
+      notifyCalls.push({
+        url: String(input),
+        body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
+      });
+      return nextNotifyResponse();
+    };
+
+    const hub = new FlagshipHubCore(
+      createSqliteAdapter(db),
+      "0.1.0",
+      async () => ({ ok: true }),
+      undefined,
+      {
+        url: "https://notify-discord.42b.eu",
+        token: "test-service-token",
+        fetchImpl: mockFetch,
+      },
+    );
+
+    await reqJson(hub, "/api/alerts", "POST", {
+      alertKey: "frontend:missing-prime-icon:pi-bolt",
+      repo: "FRONTEND",
+      channelId: "111222333444555666",
+      messageId: "999888777666555444",
+      summary: "Missing icon pi-bolt",
+    });
+    await reqJson(hub, "/api/alerts", "POST", {
+      alertKey: "backend:cron:fail",
+      repo: "BACKEND",
+      summary: "Cron failed",
+    });
+
+    // PATCH to working triggers notify-discord /alert/status with exact contract payload
+    const patchWorking = await reqJson(
+      hub,
+      `/api/alerts/${encodeURIComponent("frontend:missing-prime-icon:pi-bolt")}`,
+      "PATCH",
+      {
+        status: "working",
+        threadId: "th_worker_9",
+        threadLink: "https://app.t3.codes/threads/env/9",
+        note: "Dispatched worktree worker",
+      },
+    );
+    expect(patchWorking.status).toBe(200);
+    expect(patchWorking.data.ok).toBe(true);
+    expect(patchWorking.data.discordReaction).toEqual({ ok: true, status: 200 });
+    expect(notifyCalls).toHaveLength(1);
+    expect(notifyCalls[0].url).toBe("https://notify-discord.42b.eu/alert/status");
+    expect(notifyCalls[0].body).toEqual({
+      channelId: "111222333444555666",
+      messageId: "999888777666555444",
+      alertKey: "frontend:missing-prime-icon:pi-bolt",
+      state: "working",
+      repoPath: "https://github.com/sesam/flagship",
+      token: "test-service-token",
+    });
+
+    // PATCH to resolved when notify-discord returns 502 still succeeds without crashing
+    nextNotifyResponse = async () => new Response("upstream 502", { status: 502 });
+    const patchResolved = await reqJson(
+      hub,
+      `/api/alerts/${encodeURIComponent("frontend:missing-prime-icon:pi-bolt")}`,
+      "PATCH",
+      { status: "resolved", note: "Shipped fix" },
+    );
+    expect(patchResolved.status).toBe(200);
+    expect((patchResolved.data.alert as { status: string }).status).toBe("resolved");
+    expect(patchResolved.data.discordReaction).toEqual({
+      ok: false,
+      status: 502,
+      error: "upstream 502",
+    });
+
+    // GET /api/alerts default (open,working) vs ?status=all vs ?status=open
+    const listDefault = await reqJson(hub, "/api/alerts");
+    expect((listDefault.data.alerts as Array<{ alertKey: string }>).map((a) => a.alertKey)).toEqual([
+      "backend:cron:fail",
+    ]);
+
+    const listAll = await reqJson(hub, "/api/alerts?status=all");
+    expect((listAll.data.alerts as Array<{ alertKey: string }>).length).toBe(2);
+
+    // 404 on unknown alertKey
+    const missing = await reqJson(hub, "/api/alerts/no-such-alert", "PATCH", { status: "working" });
+    expect(missing.status).toBe(404);
+
+    // MCP flagship_alerts + flagship_alert_update
+    nextNotifyResponse = async () => new Response(JSON.stringify({ ok: true }), { status: 200 });
+    const mcpList = await reqJson(hub, "/mcp", "POST", {
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/call",
+      params: { name: "flagship_alerts", arguments: { status: "open" } },
+    });
+    const listedAlerts = (
+      mcpList.data.result as { structuredContent: { alerts: Array<{ alertKey: string }> } }
+    ).structuredContent.alerts;
+    expect(listedAlerts.map((a) => a.alertKey)).toEqual(["backend:cron:fail"]);
+
+    const mcpUpdate = await reqJson(hub, "/mcp", "POST", {
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: {
+        name: "flagship_alert_update",
+        arguments: {
+          alertKey: "backend:cron:fail",
+          status: "false_positive",
+          note: "Transient DNS blip",
+        },
+      },
+    });
+    const updated = (
+      mcpUpdate.data.result as {
+        structuredContent: { alert: { status: string }; discordReaction: { ok: boolean } };
+      }
+    ).structuredContent;
+    expect(updated.alert.status).toBe("false_positive");
+    expect(updated.discordReaction.ok).toBe(true);
+  });
+});

@@ -154,6 +154,39 @@ export const MCP_TOOLS: McpToolDefinition[] = [
       },
     },
   },
+  {
+    name: "flagship_alerts",
+    description:
+      "List proactive Discord/ops alerts tracked by Flagship (defaults to open and working; pass status='all' for full history).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: {
+          type: "string",
+          description: "Filter by status: open, working, resolved, false_positive, wontfix, open,working (default), or all",
+        },
+      },
+    },
+  },
+  {
+    name: "flagship_alert_update",
+    description:
+      "Update a proactive alert's lifecycle status (working, resolved, false_positive, wontfix, open), attach a worker thread link or note, and automatically update the Discord reaction (⏳ / ✅ / 🤷 / 🚫).",
+    inputSchema: {
+      type: "object",
+      required: ["alertKey", "status"],
+      properties: {
+        alertKey: { type: "string" },
+        status: {
+          type: "string",
+          enum: ["open", "working", "resolved", "false_positive", "wontfix"],
+        },
+        threadId: { type: "string" },
+        threadLink: { type: "string" },
+        note: { type: "string" },
+      },
+    },
+  },
 ];
 
 export type McpToolHandler = (

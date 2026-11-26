@@ -244,6 +244,8 @@ describe("MCP endpoint", () => {
     expect(tools.some((t) => t.name === "flagship_overview")).toBe(true);
     expect(tools.some((t) => t.name === "flagship_dispatch")).toBe(true);
     expect(tools.some((t) => t.name === "flagship_dismiss")).toBe(true);
+    expect(tools.some((t) => t.name === "flagship_alerts")).toBe(true);
+    expect(tools.some((t) => t.name === "flagship_alert_update")).toBe(true);
 
     const call = await handleMcpRequest(
       { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "flagship_overview", arguments: {} } },

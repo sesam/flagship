@@ -13,6 +13,7 @@ import os
 import ssl
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,7 @@ def print_overview(data: dict[str, Any]) -> None:
         f"Nodes: {counts.get('nodesOnline', 0)}/{counts.get('nodesTotal', 0)} online | "
         f"Active threads: {counts.get('threadsActive', 0)} | "
         f"Needs attention: {counts.get('needsAttention', 0)} | "
+        f"Open alerts: {counts.get('openAlerts', 0)} | "
         f"Ideas inbox: {counts.get('ideasInbox', 0)}"
     )
     print("\n-- Machines --")
@@ -95,6 +97,18 @@ def print_overview(data: dict[str, Any]) -> None:
             tag = "STALLED" if th.get("stalled") else th.get("status", "").upper()
             link = f" -> {th['link']}" if th.get("link") else ""
             print(f"  [{tag}] [{th['nodeId']}] {th['title']}{link}")
+
+    alerts = data.get("openAlerts", [])
+    if alerts:
+        print("\n-- Open Alerts --")
+        for a in alerts:
+            repo = f" ({a['repo']})" if a.get("repo") else ""
+            hits = f" [x{a['hitCount']}]" if a.get("hitCount", 1) > 1 else ""
+            link = f" -> {a['threadLink']}" if a.get("threadLink") else ""
+            print(
+                f"  [{a.get('status', 'open').upper()}] [{a.get('severity', 'ops')}] "
+                f"{a['alertKey']}{repo}{hits}: {a.get('summary', '')}{link}"
+            )
 
     inflight = data.get("inFlight", [])
     if inflight:
@@ -177,6 +191,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_idea_upd.add_argument("--node", dest="assigned_node")
     p_idea_upd.add_argument("--thread-id")
     p_idea_upd.add_argument("--thread-link")
+
+    p_alert = sub.add_parser("alert", help="Manage proactive Discord/ops alerts")
+    alert_sub = p_alert.add_subparsers(dest="alert_cmd", required=True)
+    p_alert_list = alert_sub.add_parser("list", help="List open/working alerts (or --all)")
+    p_alert_list.add_argument("--all", action="store_true", dest="show_all", help="Include resolved/closed alerts")
+
+    p_alert_upd = alert_sub.add_parser("update", help="Update alert status and flip Discord reaction")
+    p_alert_upd.add_argument("alert_key")
+    p_alert_upd.add_argument(
+        "--status",
+        required=True,
+        choices=["open", "working", "resolved", "false_positive", "wontfix"],
+    )
+    p_alert_upd.add_argument("--thread-id")
+    p_alert_upd.add_argument("--thread-link")
+    p_alert_upd.add_argument("--note")
 
     p_sd = sub.add_parser("stand-down", help="Hard pause Flagship wakeups & auto-dispatch")
     p_sd.add_argument("reason", nargs="?", default="Paused by operator")
@@ -274,6 +304,23 @@ def main(argv: list[str] | None = None) -> None:
                 if v is not None
             }
             print(json.dumps(api(hub, token, f"/api/ideas/{args.id}", "PATCH", payload), indent=2))
+    elif args.cmd == "alert":
+        if args.alert_cmd == "list":
+            path = "/api/alerts?status=all" if args.show_all else "/api/alerts"
+            print(json.dumps(api(hub, token, path), indent=2))
+        elif args.alert_cmd == "update":
+            payload = {
+                k: v
+                for k, v in {
+                    "status": args.status,
+                    "threadId": args.thread_id,
+                    "threadLink": args.thread_link,
+                    "note": args.note,
+                }.items()
+                if v is not None
+            }
+            encoded_key = urllib.parse.quote(args.alert_key, safe="")
+            print(json.dumps(api(hub, token, f"/api/alerts/{encoded_key}", "PATCH", payload), indent=2))
     elif args.cmd == "stand-down":
         print(json.dumps(api(hub, token, "/api/control/stand-down", "POST", {"reason": args.reason}), indent=2))
     elif args.cmd == "resume":

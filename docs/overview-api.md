@@ -24,7 +24,8 @@ Authorization: Bearer <FLAGSHIP_TOKEN>
     "threadsActive": 3,
     "needsAttention": 1,
     "ideasInbox": 5,
-    "pendingCommands": 0
+    "pendingCommands": 0,
+    "openAlerts": 0
   },
   "nodes": [
     {
@@ -48,6 +49,7 @@ Authorization: Bearer <FLAGSHIP_TOKEN>
   "needsAttention": [],
   "inFlight": [],
   "ideas": [],
+  "openAlerts": [],
   "recentEvents": [],
   "rebalanceSuggestions": []
 }

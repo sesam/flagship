@@ -40,7 +40,7 @@ export default {
           ok: true,
           service: "flagship-hub",
           version: env.FLAGSHIP_VERSION ?? "0.1.0",
-          endpoints: ["/health", "/api/overview", "/api/nodes/heartbeat", "/api/route", "/api/dispatch", "/api/ideas", "/mcp"],
+          endpoints: ["/health", "/api/overview", "/api/nodes/heartbeat", "/api/route", "/api/dispatch", "/api/ideas", "/api/alerts", "/mcp"],
         }),
         {
           status: 200,

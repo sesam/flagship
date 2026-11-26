@@ -14,6 +14,33 @@ export type TaskVisibility = "business" | "public" | "private-spot";
 
 export type Priority = "P0" | "P1" | "P2" | "P3";
 
+export type AlertStatus = "open" | "working" | "resolved" | "false_positive" | "wontfix";
+
+export interface AlertRecord {
+  alertKey: string;
+  repo: string | null;
+  channelId: string | null;
+  messageId: string | null;
+  source: string;
+  severity: string;
+  status: AlertStatus;
+  summary: string;
+  text: string;
+  threadId: string | null;
+  threadLink: string | null;
+  silentFirst: boolean;
+  hitCount: number;
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DiscordReactionResult {
+  ok: boolean;
+  status?: number;
+  error?: string;
+}
+
 export interface MobileDevice {
   id: string;
   platform: "android" | "ios";
@@ -198,11 +225,13 @@ export interface OverviewResponse {
     needsAttention: number;
     ideasInbox: number;
     pendingCommands: number;
+    openAlerts: number;
   };
   nodes: NodeRecord[];
   needsAttention: StoredThread[];
   inFlight: StoredThread[];
   ideas: IdeaRecord[];
+  openAlerts: AlertRecord[];
   recentEvents: FleetEvent[];
   rebalanceSuggestions: RebalanceSuggestion[];
 }
@@ -212,4 +241,7 @@ export interface Env {
   FLAGSHIP_TOKEN?: string;
   FLAGSHIP_VERSION?: string;
   CORS_ORIGIN?: string;
+  NOTIFY_DISCORD_URL?: string;
+  NOTIFY_DISCORD_TOKEN?: string;
+  NOTIFY_DISCORD_REPO_PATH?: string;
 }

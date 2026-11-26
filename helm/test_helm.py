@@ -128,6 +128,89 @@ class HelmTests(unittest.TestCase):
             helm.main(["dismiss"])
         self.assertEqual(ctx.exception.code, 2)
 
+    def test_print_overview_renders_open_alerts(self) -> None:
+        sample = {
+            "standDown": False,
+            "standDownReason": None,
+            "counts": {
+                "nodesOnline": 1,
+                "nodesTotal": 1,
+                "threadsActive": 0,
+                "needsAttention": 0,
+                "openAlerts": 1,
+                "ideasInbox": 0,
+            },
+            "nodes": [],
+            "needsAttention": [],
+            "openAlerts": [
+                {
+                    "alertKey": "frontend:missing-prime-icon:pi-bolt",
+                    "repo": "FRONTEND",
+                    "severity": "bug",
+                    "status": "working",
+                    "summary": "PrimeIcons glyph missing: pi-bolt",
+                    "hitCount": 3,
+                    "threadLink": "https://app.t3.codes/threads/env/99",
+                }
+            ],
+            "inFlight": [],
+            "rebalanceSuggestions": [],
+            "ideas": [],
+        }
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            helm.print_overview(sample)
+        rendered = buf.getvalue()
+        self.assertIn("Open alerts: 1", rendered)
+        self.assertIn("-- Open Alerts --", rendered)
+        self.assertIn("[WORKING] [bug] frontend:missing-prime-icon:pi-bolt (FRONTEND) [x3]", rendered)
+        self.assertIn("https://app.t3.codes/threads/env/99", rendered)
+
+    def test_alert_list_and_update(self) -> None:
+        calls: list[tuple[str, str, dict | None]] = []
+
+        def fake_api(hub: str, token: str, path: str, method: str = "GET", payload=None):
+            calls.append((path, method, payload))
+            return {"ok": True}
+
+        buf = io.StringIO()
+        with mock.patch.object(helm, "load_auth", return_value=("https://hub.test", "tok")), \
+             mock.patch.object(helm, "api", side_effect=fake_api), \
+             contextlib.redirect_stdout(buf):
+            helm.main(["alert", "list"])
+            helm.main(["alert", "list", "--all"])
+            helm.main([
+                "alert",
+                "update",
+                "frontend:missing-prime-icon:pi-bolt",
+                "--status",
+                "working",
+                "--thread-id",
+                "th_99",
+                "--thread-link",
+                "https://app.t3.codes/threads/env/99",
+                "--note",
+                "Investigating",
+            ])
+
+        self.assertEqual(
+            calls,
+            [
+                ("/api/alerts", "GET", None),
+                ("/api/alerts?status=all", "GET", None),
+                (
+                    "/api/alerts/frontend%3Amissing-prime-icon%3Api-bolt",
+                    "PATCH",
+                    {
+                        "status": "working",
+                        "threadId": "th_99",
+                        "threadLink": "https://app.t3.codes/threads/env/99",
+                        "note": "Investigating",
+                    },
+                ),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,11 @@ export class FlagshipHub extends DurableObject<Env> {
       env.FLAGSHIP_VERSION ?? "0.1.0",
       undefined,
       env.CORS_ORIGIN,
+      {
+        url: env.NOTIFY_DISCORD_URL,
+        token: env.NOTIFY_DISCORD_TOKEN,
+        repoPath: env.NOTIFY_DISCORD_REPO_PATH,
+      },
     );
   }
 

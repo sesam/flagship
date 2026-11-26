@@ -19,6 +19,8 @@ Use `helm` (installed via `./helm/install.sh` to `~/.local/bin/helm`), or the eq
 - `helm dispatch "<title>" --prompt "..." --project <name> --mode plan` — get `targetEnvironmentId` + `targetProject` so you can call `t3_thread_launch` directly (instant, native T3 thread link!).
 - `helm dispatch "<title>" --prompt "..." --project <name> --mode lookout` — queue launch via the target node's Lookout agent (works even for machines not directly T3-linked, e.g. a Windows VM or Raspberry Pi).
 - `helm dismiss <threadId>` / `helm dismiss --all-failed` — clear stale `[FAILED]` or noisy attention threads from `overview` (clears automatically if that thread runs again).
+- `helm alert list [--all]` — list open/working proactive Discord/ops alerts (`--all` for history).
+- `helm alert update <alertKey> --status working|resolved|false_positive|wontfix [--thread-id ...] [--thread-link ...] [--note ...]` — update alert lifecycle status and flip the Discord message reaction (`⏳` / `✅` / `🤷` / `🚫`) with zero extra Discord spam rows.
 - `helm webhook set "<url>" --thread-id "<currentThreadId>"` — bind wakeup webhook and suppress self-wakeups at the Hub.
 - `helm stand-down "<reason>"` / `helm resume` — hard kill switch.
 
@@ -41,3 +43,10 @@ When woken by a Flagship webhook payload:
 2. For `thread_needs_input`: summarize the exact question and recommended choice in 2 bullet lines for the operator.
 3. For `thread_completed`: summarize the outcome + clickable link; update the idea status to `done`; if follow-up work is unblocked, dispatch it.
 4. For `thread_stalled` / `thread_failed`: inspect once, steer or re-route to a healthier node (or `helm dismiss <threadId>` if obsolete), and report concisely.
+5. For `discord_alert` (**Proactive Discord Alert Auto-Triage**):
+   - Inspect via `helm alert list` (or `flagship_alerts`) to verify `alertKey`, `repo`, `severity`, `summary`, `text`, and `hitCount`.
+   - Immediately run `helm alert update <alertKey> --status working` to stamp `⏳` on Discord.
+   - Route to the healthiest online node with `repo` already known and launch an isolated worktree fix worker (`workspaceStrategy: { type: "worktree", baseRef: "origin/main", startFromOrigin: true }`); record the thread with `helm alert update <alertKey> --status working --thread-id <id> --thread-link <link>`.
+     - **Two-way door** (clear, reversible fix): commit, test, push, and deploy autonomously (unless held in `~/.flagship/policy.md`).
+     - **One-way door or ambiguous**: pause before applying/deploying and escalate cleanly to Simon.
+   - On completion, run `helm alert update <alertKey> --status resolved --note "<summary/commit>"` (clears `⏳`, stamps `✅`, zero extra Discord spam rows!). For noise/non-bugs, mark `--status false_positive` (`🤷`) or `--status wontfix` (`🚫`).

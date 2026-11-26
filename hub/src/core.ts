@@ -1,7 +1,10 @@
 import { handleMcpRequest } from "./mcp";
 import { buildRebalanceSuggestions, inferWorkload, routeTask } from "./router";
 import type {
+  AlertRecord,
+  AlertStatus,
   CommandRecord,
+  DiscordReactionResult,
   FleetEvent,
   HeartbeatPayload,
   IdeaRecord,
@@ -19,6 +22,32 @@ const OFFLINE_NODE_MS = 300_000;
 const STALL_THREAD_MS = 20 * 60_000; // 20 min without itemCount/update movement while running
 const MAX_STORED_EVENTS = 500;
 const MAX_FINISHED_COMMANDS = 200;
+const DEFAULT_ALERT_COOLDOWN_SECONDS = 21_600; // 6 hours
+const DEFAULT_NOTIFY_DISCORD_REPO_PATH = "https://github.com/sesam/flagship";
+const VALID_ALERT_STATUSES: ReadonlySet<AlertStatus> = new Set([
+  "open",
+  "working",
+  "resolved",
+  "false_positive",
+  "wontfix",
+]);
+const REACTION_ALERT_STATUSES: ReadonlySet<AlertStatus> = new Set([
+  "working",
+  "resolved",
+  "false_positive",
+  "wontfix",
+]);
+
+export interface NotifyDiscordConfig {
+  url?: string;
+  token?: string;
+  repoPath?: string;
+  fetchImpl?: typeof fetch;
+}
+
+class NotFoundError extends Error {
+  readonly status = 404;
+}
 
 export interface SqlCursorLike<T = Record<string, unknown>> {
   toArray(): T[];
@@ -80,6 +109,7 @@ export class FlagshipHubCore {
     private readonly version = "0.1.0",
     private readonly webhookPusher: WebhookPusher = pushHelmWebhook,
     private readonly corsOrigin?: string,
+    private readonly notifyDiscord?: NotifyDiscordConfig,
   ) {}
 
   private json(data: unknown, status = 200): Response {
@@ -164,6 +194,25 @@ export class FlagshipHubCore {
         payload_json TEXT NOT NULL DEFAULT '{}',
         delivered INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS alerts (
+        alert_key TEXT PRIMARY KEY,
+        repo TEXT,
+        channel_id TEXT,
+        message_id TEXT,
+        source TEXT,
+        severity TEXT,
+        status TEXT,
+        summary TEXT,
+        text TEXT,
+        thread_id TEXT,
+        thread_link TEXT,
+        silent_first INTEGER DEFAULT 0,
+        hit_count INTEGER DEFAULT 1,
+        note TEXT,
+        created_at TEXT,
+        updated_at TEXT
       );
     `);
 
@@ -644,10 +693,377 @@ export class FlagshipHubCore {
     });
   }
 
+  private rowToAlert(r: {
+    alert_key: string;
+    repo: string | null;
+    channel_id: string | null;
+    message_id: string | null;
+    source: string | null;
+    severity: string | null;
+    status: string | null;
+    summary: string | null;
+    text: string | null;
+    thread_id: string | null;
+    thread_link: string | null;
+    silent_first: number | null;
+    hit_count: number | null;
+    note: string | null;
+    created_at: string | null;
+    updated_at: string | null;
+  }): AlertRecord {
+    return {
+      alertKey: r.alert_key,
+      repo: r.repo ?? null,
+      channelId: r.channel_id ?? null,
+      messageId: r.message_id ?? null,
+      source: r.source ?? "discord",
+      severity: r.severity ?? "ops",
+      status: (VALID_ALERT_STATUSES.has(r.status as AlertStatus) ? r.status : "open") as AlertStatus,
+      summary: r.summary ?? "",
+      text: r.text ?? "",
+      threadId: r.thread_id ?? null,
+      threadLink: r.thread_link ?? null,
+      silentFirst: Boolean(r.silent_first),
+      hitCount: r.hit_count ?? 1,
+      note: r.note ?? null,
+      createdAt: r.created_at ?? "",
+      updatedAt: r.updated_at ?? "",
+    };
+  }
+
+  private getAlert(alertKey: string): AlertRecord | null {
+    const rows = this.sql
+      .exec<{
+        alert_key: string;
+        repo: string | null;
+        channel_id: string | null;
+        message_id: string | null;
+        source: string | null;
+        severity: string | null;
+        status: string | null;
+        summary: string | null;
+        text: string | null;
+        thread_id: string | null;
+        thread_link: string | null;
+        silent_first: number | null;
+        hit_count: number | null;
+        note: string | null;
+        created_at: string | null;
+        updated_at: string | null;
+      }>("SELECT * FROM alerts WHERE alert_key = ?", alertKey)
+      .toArray();
+    return rows[0] ? this.rowToAlert(rows[0]) : null;
+  }
+
+  private listAlerts(statusParam?: string | null): AlertRecord[] {
+    const raw = (statusParam ?? "").trim();
+    const isAll = raw.toLowerCase() === "all";
+    let rows: Array<{
+      alert_key: string;
+      repo: string | null;
+      channel_id: string | null;
+      message_id: string | null;
+      source: string | null;
+      severity: string | null;
+      status: string | null;
+      summary: string | null;
+      text: string | null;
+      thread_id: string | null;
+      thread_link: string | null;
+      silent_first: number | null;
+      hit_count: number | null;
+      note: string | null;
+      created_at: string | null;
+      updated_at: string | null;
+    }>;
+
+    if (isAll) {
+      rows = this.sql
+        .exec("SELECT * FROM alerts ORDER BY updated_at DESC, created_at DESC LIMIT 200")
+        .toArray() as typeof rows;
+    } else {
+      const requested = raw
+        ? raw
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : ["open", "working"];
+      const valid = requested.filter((s) => VALID_ALERT_STATUSES.has(s as AlertStatus));
+      if (valid.length === 0) {
+        throw new Error(
+          `Invalid status filter: ${raw}. Allowed: open, working, resolved, false_positive, wontfix, all`,
+        );
+      }
+      const placeholders = valid.map(() => "?").join(", ");
+      rows = this.sql
+        .exec(
+          `SELECT * FROM alerts WHERE status IN (${placeholders}) ORDER BY updated_at DESC, created_at DESC LIMIT 200`,
+          ...valid,
+        )
+        .toArray() as typeof rows;
+    }
+
+    return rows.map((r) => this.rowToAlert(r));
+  }
+
+  private async ingestAlert(
+    body: Record<string, unknown>,
+  ): Promise<{ status: number; payload: { ok: true; deduped: boolean; alert: AlertRecord } }> {
+    const alertKey = typeof body.alertKey === "string" ? body.alertKey.trim() : "";
+    const summary = typeof body.summary === "string" ? body.summary.trim() : "";
+    if (!alertKey || !summary) {
+      throw new Error("alertKey and summary are required");
+    }
+
+    const repo = typeof body.repo === "string" && body.repo.trim() ? body.repo.trim() : null;
+    const channelId =
+      typeof body.channelId === "string" && body.channelId.trim() ? body.channelId.trim() : null;
+    const messageId =
+      typeof body.messageId === "string" && body.messageId.trim() ? body.messageId.trim() : null;
+    const source =
+      typeof body.source === "string" && body.source.trim() ? body.source.trim() : "discord";
+    const severity =
+      typeof body.severity === "string" && body.severity.trim() ? body.severity.trim() : "ops";
+    const text = typeof body.text === "string" ? body.text : "";
+    const silentFirst = body.silentFirst === true;
+    const rawCooldown = Number(body.cooldownSeconds);
+    const cooldownSeconds =
+      body.cooldownSeconds !== undefined && Number.isFinite(rawCooldown) && rawCooldown >= 0
+        ? rawCooldown
+        : DEFAULT_ALERT_COOLDOWN_SECONDS;
+
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
+    const existing = this.getAlert(alertKey);
+
+    if (existing) {
+      const isOpenOrWorking = existing.status === "open" || existing.status === "working";
+      const isTerminal =
+        existing.status === "resolved" ||
+        existing.status === "false_positive" ||
+        existing.status === "wontfix";
+      const updatedMs = Date.parse(existing.updatedAt);
+      const withinCooldown =
+        isTerminal &&
+        Number.isFinite(updatedMs) &&
+        nowMs - updatedMs < cooldownSeconds * 1000;
+
+      if (isOpenOrWorking || withinCooldown) {
+        const nextHits = existing.hitCount + 1;
+        const nextChannelId = channelId ?? existing.channelId;
+        const nextMessageId = messageId ?? existing.messageId;
+        this.sql.exec(
+          `UPDATE alerts SET
+            hit_count = ?,
+            updated_at = ?,
+            channel_id = ?,
+            message_id = ?
+          WHERE alert_key = ?`,
+          nextHits,
+          now,
+          nextChannelId,
+          nextMessageId,
+          alertKey,
+        );
+        const updated: AlertRecord = {
+          ...existing,
+          hitCount: nextHits,
+          updatedAt: now,
+          channelId: nextChannelId,
+          messageId: nextMessageId,
+        };
+        return { status: 200, payload: { ok: true, deduped: true, alert: updated } };
+      }
+    }
+
+    this.sql.exec(
+      `INSERT INTO alerts (
+        alert_key, repo, channel_id, message_id, source, severity, status,
+        summary, text, thread_id, thread_link, silent_first, hit_count, note,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, NULL, NULL, ?, 1, NULL, ?, ?)
+      ON CONFLICT(alert_key) DO UPDATE SET
+        repo = excluded.repo,
+        channel_id = excluded.channel_id,
+        message_id = excluded.message_id,
+        source = excluded.source,
+        severity = excluded.severity,
+        status = 'open',
+        summary = excluded.summary,
+        text = excluded.text,
+        thread_id = NULL,
+        thread_link = NULL,
+        silent_first = excluded.silent_first,
+        hit_count = 1,
+        note = NULL,
+        created_at = excluded.created_at,
+        updated_at = excluded.updated_at`,
+      alertKey,
+      repo,
+      channelId,
+      messageId,
+      source,
+      severity,
+      summary,
+      text,
+      silentFirst ? 1 : 0,
+      now,
+      now,
+    );
+
+    const alert: AlertRecord = {
+      alertKey,
+      repo,
+      channelId,
+      messageId,
+      source,
+      severity,
+      status: "open",
+      summary,
+      text,
+      threadId: null,
+      threadLink: null,
+      silentFirst,
+      hitCount: 1,
+      note: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const ev = this.recordEvent(
+      "discord_alert",
+      null,
+      null,
+      `[Alert] (${repo ?? "unknown"}) ${summary}`,
+      {
+        alertKey,
+        repo,
+        channelId,
+        messageId,
+        severity,
+        silentFirst,
+      },
+    );
+    await this.maybePushWebhook([ev]);
+
+    return { status: 201, payload: { ok: true, deduped: false, alert } };
+  }
+
+  private async notifyDiscordAlertStatus(
+    alert: AlertRecord,
+  ): Promise<DiscordReactionResult | null> {
+    if (!REACTION_ALERT_STATUSES.has(alert.status)) {
+      return null;
+    }
+    const baseUrl = this.notifyDiscord?.url?.trim().replace(/\/+$/, "");
+    const token = this.notifyDiscord?.token?.trim();
+    if (!baseUrl || !token) {
+      return null;
+    }
+    const hasTarget = Boolean((alert.channelId && alert.messageId) || alert.alertKey);
+    if (!hasTarget) {
+      return null;
+    }
+
+    const repoPath =
+      this.notifyDiscord?.repoPath?.trim() || DEFAULT_NOTIFY_DISCORD_REPO_PATH;
+    const fetchFn = this.notifyDiscord?.fetchImpl ?? fetch;
+
+    try {
+      const res = await fetchFn(`${baseUrl}/alert/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(alert.channelId ? { channelId: alert.channelId } : {}),
+          ...(alert.messageId ? { messageId: alert.messageId } : {}),
+          alertKey: alert.alertKey,
+          state: alert.status,
+          repoPath,
+          token,
+        }),
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        return {
+          ok: false,
+          status: res.status,
+          error: errText.slice(0, 300) || `HTTP ${res.status}`,
+        };
+      }
+      return { ok: true, status: res.status };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  private async updateAlert(
+    alertKey: string,
+    body: Record<string, unknown>,
+  ): Promise<{ ok: true; alert: AlertRecord; discordReaction: DiscordReactionResult | null }> {
+    const key = alertKey.trim();
+    if (!key) {
+      throw new Error("alertKey is required");
+    }
+    const existing = this.getAlert(key);
+    if (!existing) {
+      throw new NotFoundError(`Alert not found: ${key}`);
+    }
+
+    let nextStatus: AlertStatus = existing.status;
+    if ("status" in body && body.status !== undefined) {
+      const candidate = String(body.status).trim() as AlertStatus;
+      if (!VALID_ALERT_STATUSES.has(candidate)) {
+        throw new Error(
+          `Invalid alert status: ${String(body.status)}. Allowed: open, working, resolved, false_positive, wontfix`,
+        );
+      }
+      nextStatus = candidate;
+    }
+
+    const nextThreadId =
+      typeof body.threadId === "string" ? body.threadId.trim() || null : existing.threadId;
+    const nextThreadLink =
+      typeof body.threadLink === "string" ? body.threadLink.trim() || null : existing.threadLink;
+    const nextNote = typeof body.note === "string" ? body.note : existing.note;
+    const now = nowIso();
+
+    this.sql.exec(
+      `UPDATE alerts SET
+        status = ?,
+        thread_id = ?,
+        thread_link = ?,
+        note = ?,
+        updated_at = ?
+      WHERE alert_key = ?`,
+      nextStatus,
+      nextThreadId,
+      nextThreadLink,
+      nextNote,
+      now,
+      key,
+    );
+
+    const updated: AlertRecord = {
+      ...existing,
+      status: nextStatus,
+      threadId: nextThreadId,
+      threadLink: nextThreadLink,
+      note: nextNote,
+      updatedAt: now,
+    };
+
+    const discordReaction = await this.notifyDiscordAlertStatus(updated);
+    return { ok: true, alert: updated, discordReaction };
+  }
+
   private getOverview(): OverviewResponse {
     const nodes = this.listNodes();
     const threads = this.listThreads();
     const ideas = this.listIdeas();
+    const openAlerts = this.listAlerts("open,working");
     const recentEvents = this.listEvents(20);
     const { standDown, reason } = this.isStandDown();
 
@@ -679,11 +1095,13 @@ export class FlagshipHubCore {
         needsAttention: needsAttention.length,
         ideasInbox: ideas.filter((i) => i.status === "inbox").length,
         pendingCommands: pendingCommandsRow?.c ?? 0,
+        openAlerts: openAlerts.length,
       },
       nodes,
       needsAttention,
       inFlight,
       ideas,
+      openAlerts,
       recentEvents,
       rebalanceSuggestions: buildRebalanceSuggestions(nodes, threads),
     };
@@ -1047,6 +1465,10 @@ export class FlagshipHubCore {
         return this.dismissThreads(args);
       case "flagship_events":
         return { events: this.listEvents(Number(args.limit ?? 25)) };
+      case "flagship_alerts":
+        return { alerts: this.listAlerts(typeof args.status === "string" ? args.status : undefined) };
+      case "flagship_alert_update":
+        return await this.updateAlert(String(args.alertKey ?? ""), args);
       default:
         throw new Error(`Unsupported MCP tool: ${name}`);
     }
@@ -1089,6 +1511,24 @@ export class FlagshipHubCore {
       if (ideaMatch && method === "PATCH") {
         const body = (await request.json()) as Record<string, unknown>;
         return this.json(this.updateIdea(decodeURIComponent(ideaMatch[1]), body));
+      }
+
+      if (path === "/api/alerts" && method === "GET") {
+        const statusParam = url.searchParams.get("status");
+        return this.json({ alerts: this.listAlerts(statusParam) });
+      }
+
+      if (path === "/api/alerts" && method === "POST") {
+        const body = (await request.json()) as Record<string, unknown>;
+        const result = await this.ingestAlert(body);
+        return this.json(result.payload, result.status);
+      }
+
+      const alertMatch = path.match(/^\/api\/alerts\/(.+)$/);
+      if (alertMatch && method === "PATCH") {
+        const body = (await request.json()) as Record<string, unknown>;
+        const result = await this.updateAlert(decodeURIComponent(alertMatch[1]), body);
+        return this.json(result);
       }
 
       if (path === "/api/dispatch" && method === "POST") {
@@ -1187,9 +1627,10 @@ export class FlagshipHubCore {
 
       return this.json({ error: `Not found: ${method} ${path}` }, 404);
     } catch (err) {
+      const status = err instanceof NotFoundError ? err.status : 400;
       return this.json(
         { error: err instanceof Error ? err.message : String(err) },
-        400,
+        status,
       );
     }
   }
